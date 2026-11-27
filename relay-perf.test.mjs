@@ -752,7 +752,7 @@ test('MOBILE_JS cold-boot prefetch, 0ms snapshot delivery, AGY_CSRF_UPDATED, and
     assert.equal(sandbox.__APP_CONFIG__.csrfToken, 'fresh-csrf-99');
     assert.equal(lsStore.get('agy_session_csrf_token'), 'fresh-csrf-99');
 
-    // Simulate background (>8s) -> visible resume with dead socket (no pong) -> 450ms teardown + prewarmed standby
+    // Simulate background (>8s) -> visible resume with dead socket (no pong) -> hot-swap to open standby & replay streams without closing!
     const visHandler = docListeners.get('visibilitychange');
     assert.equal(typeof visHandler, 'function');
     let closedCount = 0;
@@ -764,14 +764,18 @@ test('MOBILE_JS cold-boot prefetch, 0ms snapshot delivery, AGY_CSRF_UPDATED, and
     visHandler();
     assert.ok(earlyNative.sent.some((s) => s.includes('"type":"ping"') && s.includes('__agy_probe_')));
     assert.equal(nativeSockets.length, 2); // standby socket prewarmed in parallel
-    await new Promise((r) => setTimeout(r, 500));
-    assert.equal(closedCount, 1);
-    assert.equal(sock.readyState, 3);
+    await new Promise((r) => setTimeout(r, 260));
+    assert.equal(closedCount, 0);
+    assert.equal(sock.readyState, 1);
+    const hotDonor = nativeSockets[1];
+    assert.ok(hotDonor.sent.some((s) => s.includes('"streamId":"real-1"') && s.includes('StreamAgentStateUpdates')));
 
-    // Next WebSocket('/connect-websocket') claims the already-open standby socket immediately!
-    const nextSock = new sandbox.WebSocket('wss://relay.example:8421/connect-websocket');
-    assert.equal(nextSock.readyState, 1);
-    assert.equal(nativeSockets.length, 2);
+    // Reply arriving on the swapped donor transport delivers cleanly through sock!
+    hotDonor.onmessage(new MessageEvent('message', {
+      data: JSON.stringify({ streamId: 'real-1', type: 'data', payload: { conversationId: cid, replayed: true } }),
+    }));
+    await new Promise((r) => setTimeout(r, 5));
+    assert.ok(received.some((m) => m.streamId === 'real-1' && m.payload?.replayed === true));
   } finally {
     for (const id of timers) clearTimeout(id);
     for (const id of intervals) clearInterval(id);
@@ -1856,6 +1860,287 @@ test('web-push subscribe skips redundant disk writes for unchanged active subscr
   } finally {
     manager.dispose();
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('SW_JS preserves versioned /main.js in persistent asset cache across SW upgrades', async () => {
+  const listeners = new Map();
+  const cachesBacking = new Map([
+    ['agy-relay-static-v12', new Map([
+      ['https://relay.example:8421/__agy_app_shell', new Response('<html>old-shell</html>', { status: 200 })],
+      ['https://relay.example:8421/main.js?v=keep123', new Response('console.log("cached-main");', { status: 200 })],
+    ])],
+  ]);
+  const deletedCaches = [];
+  let fetchCalls = 0;
+
+  const makeCacheApi = (map) => ({
+    keys: async () => Array.from(map.keys()).map((u) => ({ url: u })),
+    match: async (k) => {
+      const key = typeof k === 'string' ? k : k?.url;
+      if (map.has(key)) return map.get(key).clone();
+      for (const [entryUrl, resp] of map.entries()) {
+        try {
+          const u = new URL(entryUrl);
+          if (u.pathname + u.search === key) return resp.clone();
+        } catch {}
+      }
+      return undefined;
+    },
+    put: async (k, resp) => {
+      const key = typeof k === 'string' ? k : k?.url;
+      map.set(key, resp);
+    },
+  });
+
+  const sandbox = {
+    URL,
+    Headers,
+    Response,
+    AbortController,
+    setTimeout,
+    clearTimeout,
+    atob: (b64) => Buffer.from(b64, 'base64').toString('binary'),
+    caches: {
+      keys: async () => Array.from(cachesBacking.keys()),
+      delete: async (k) => {
+        deletedCaches.push(k);
+        return cachesBacking.delete(k);
+      },
+      open: async (name) => {
+        if (!cachesBacking.has(name)) cachesBacking.set(name, new Map());
+        return makeCacheApi(cachesBacking.get(name));
+      },
+    },
+    fetch: async (req) => {
+      fetchCalls++;
+      const url = typeof req === 'string' ? req : req.url;
+      if (url.endsWith('/')) {
+        return new Response('<html><script>window.__APP_CONFIG__={"csrfToken":"c1"};</script></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html', 'x-agy-shell-hash': 'shell-v13' },
+        });
+      }
+      return new Response('network-main', { status: 200 });
+    },
+    self: null,
+  };
+
+  sandbox.self = {
+    location: { origin: 'https://relay.example:8421' },
+    clients: { claim: async () => {}, matchAll: async () => [] },
+    skipWaiting: async () => {},
+    addEventListener: (type, fn) => listeners.set(type, fn),
+  };
+
+  vm.runInNewContext(SW_JS, sandbox);
+
+  let waitP = Promise.resolve();
+  listeners.get('activate')({ waitUntil: (p) => { waitP = p; } });
+  await waitP;
+  assert.ok(deletedCaches.includes('agy-relay-static-v12'));
+  assert.ok(cachesBacking.get('agy-relay-assets-v1')?.has('https://relay.example:8421/main.js?v=keep123'));
+
+  let fetchRespPromise = null;
+  fetchCalls = 0;
+  listeners.get('fetch')({
+    request: { method: 'GET', mode: 'no-cors', url: 'https://relay.example:8421/main.js?v=keep123' },
+    waitUntil: () => {},
+    respondWith: (p) => { fetchRespPromise = p; },
+  });
+  const served = await fetchRespPromise;
+  assert.equal(await served.text(), 'console.log("cached-main");');
+  assert.equal(fetchCalls, 0);
+});
+
+test('MOBILE_JS AGY_OPEN_CASCADE pushes fresh IDB snapshot into same-convo open stream and wakes sleeping backoff timers', async () => {
+  const timers = new Set();
+  const intervals = new Set();
+  const trackTimeout = (fn, ms = 0, ...args) => {
+    const id = setTimeout(() => {
+      timers.delete(id);
+      fn(...args);
+    }, ms);
+    timers.add(id);
+    return id;
+  };
+  const trackClearTimeout = (id) => {
+    timers.delete(id);
+    clearTimeout(id);
+  };
+  const trackInterval = (fn, ms = 0, ...args) => {
+    const id = setInterval(fn, ms, ...args);
+    intervals.add(id);
+    return id;
+  };
+  const trackClearInterval = (id) => {
+    intervals.delete(id);
+    clearInterval(id);
+  };
+
+  const cid = '00000000-0000-4000-8000-000000000001';
+  const idbData = new Map([
+    [`convo:${cid}`, { key: `convo:${cid}`, data: { cascadeId: cid, steps: [{ id: 'initial-idb' }] }, updatedAt: Date.now() }],
+  ]);
+  const reqWrap = (run) => {
+    const req = { result: undefined, onsuccess: null, onerror: null, onupgradeneeded: null, onblocked: null };
+    queueMicrotask(() => run(req));
+    return req;
+  };
+  const db = {
+    objectStoreNames: { contains: () => true },
+    createObjectStore: () => ({}),
+    close: () => {},
+    transaction: () => {
+      const tx = { oncomplete: null, onerror: null, onabort: null };
+      const store = {
+        get: (k) => reqWrap((req) => { req.result = idbData.get(k); req.onsuccess?.(); }),
+        put: (v) => reqWrap((req) => { idbData.set(v.key, v); req.result = v.key; req.onsuccess?.(); }),
+        delete: (k) => reqWrap((req) => { idbData.delete(k); req.onsuccess?.(); }),
+        getAllKeys: () => reqWrap((req) => { req.result = Array.from(idbData.keys()); req.onsuccess?.(); }),
+      };
+      tx.objectStore = () => store;
+      trackTimeout(() => tx.oncomplete?.(), 2);
+      return tx;
+    },
+  };
+
+  const sockets = [];
+  class MockWS extends EventTarget {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
+    constructor(url) {
+      super();
+      this.url = url;
+      this.readyState = 0;
+      this.sent = [];
+      sockets.push(this);
+      trackTimeout(() => {
+        if (this.readyState !== 0) return;
+        this.readyState = 1;
+        this.onopen?.(new Event('open'));
+        this.dispatchEvent(new Event('open'));
+      }, 2);
+    }
+    send(raw) {
+      this.sent.push(raw);
+    }
+    close(code = 1000, reason = '') {
+      this.readyState = 3;
+      this.onclose?.({ code, reason, wasClean: true });
+    }
+  }
+
+  let swMsgListener = null;
+  const lsMap = new Map();
+  const sandbox = {
+    URL,
+    Event,
+    EventTarget,
+    MessageEvent,
+    CloseEvent: class CloseEvent extends Event {
+      constructor(type, init = {}) {
+        super(type);
+        this.code = init.code ?? 1000;
+      }
+    },
+    TextDecoder,
+    TextEncoder,
+    DecompressionStream: class {},
+    WebSocket: MockWS,
+    Response,
+    indexedDB: { open: () => reqWrap((req) => { req.result = db; req.onsuccess?.(); }) },
+    setTimeout: trackTimeout,
+    clearTimeout: trackClearTimeout,
+    setInterval: trackInterval,
+    clearInterval: trackClearInterval,
+    queueMicrotask,
+    requestAnimationFrame: (fn) => trackTimeout(fn, 0),
+    __APP_CONFIG__: { csrfToken: 'boot-csrf' },
+    localStorage: {
+      length: 0,
+      key: () => null,
+      getItem: (k) => (lsMap.has(k) ? lsMap.get(k) : null),
+      setItem: (k, v) => lsMap.set(k, String(v)),
+      removeItem: (k) => lsMap.delete(k),
+    },
+    navigator: {
+      serviceWorker: {
+        register: async () => ({}),
+        addEventListener: (type, fn) => { if (type === 'message') swMsgListener = fn; },
+      },
+    },
+    document: {
+      readyState: 'complete',
+      head: { appendChild: () => {} },
+      documentElement: { style: { setProperty: () => {}, removeProperty: () => {} }, appendChild: () => {} },
+      createElement: () => ({ setAttribute: () => {}, append: () => {} }),
+      addEventListener: () => {},
+      querySelector: () => null,
+      getElementById: () => null,
+      getElementsByTagName: () => [],
+      visibilityState: 'visible',
+    },
+    location: {
+      protocol: 'https:',
+      host: 'relay.example:8421',
+      origin: 'https://relay.example:8421',
+      href: `https://relay.example:8421/c/${cid}`,
+      pathname: `/c/${cid}`,
+      search: '',
+    },
+    fetch: async () => new Response('{}', { status: 200 }),
+    addEventListener: () => {},
+  };
+  sandbox.window = sandbox;
+  sandbox.top = sandbox;
+
+  try {
+    vm.runInNewContext(MOBILE_JS, sandbox);
+    await new Promise((r) => setTimeout(r, 15));
+
+    const sock = new sandbox.WebSocket('wss://relay.example:8421/connect-websocket');
+    const msgs = [];
+    sock.addEventListener('message', (ev) => msgs.push(JSON.parse(ev.data)));
+    sock.send(JSON.stringify({
+      streamId: 'real-same',
+      type: 'start',
+      procedure: '/exa.language_server_pb.LanguageServerService/StreamAgentStateUpdates',
+      stream: true,
+      payload: { conversationId: cid },
+    }));
+
+    // Complete frame 1 so activeStateStreams removes 'real-same', while openStateStreams retains it!
+    sockets[0].onmessage(new MessageEvent('message', {
+      data: JSON.stringify({ streamId: '__agy_pre_1', type: 'data', payload: { cascadeId: cid, steps: [{ id: 'step-before' }] } }),
+    }));
+    await new Promise((r) => setTimeout(r, 10));
+
+    // SW writes updated snapshot while user is looking elsewhere, then user taps notification for SAME conversation
+    idbData.set(`convo:${cid}`, {
+      key: `convo:${cid}`,
+      data: { cascadeId: cid, steps: [{ id: 'finished-reply' }] },
+      updatedAt: Date.now() + 100,
+    });
+    swMsgListener?.({ data: { type: 'AGY_OPEN_CASCADE', cascadeId: cid, url: `/c/${cid}` } });
+    await new Promise((r) => setTimeout(r, 15));
+    assert.ok(
+      msgs.some((m) => m.streamId === 'real-same' && m.payload?.steps?.[0]?.id === 'finished-reply'),
+      'Expected fresh IDB snapshot pushed immediately into already-open same-convo stream',
+    );
+
+    // Close active socket -> external 8000ms backoff timer is tracked and woken immediately by AGY_OPEN_CASCADE
+    sock.close();
+    let backoffWoke = false;
+    sandbox.setTimeout(() => { backoffWoke = true; }, 8000);
+    swMsgListener?.({ data: { type: 'AGY_OPEN_CASCADE', cascadeId: cid, url: `/c/${cid}` } });
+    await new Promise((r) => setTimeout(r, 15));
+    assert.equal(backoffWoke, true);
+  } finally {
+    for (const id of timers) clearTimeout(id);
+    for (const id of intervals) clearInterval(id);
   }
 });
 

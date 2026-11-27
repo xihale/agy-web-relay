@@ -257,19 +257,22 @@
     });
     window.addEventListener?.('online', () => {
       retryCount = 0;
+      wakeControlBackoff?.();
       checkRelayHealth();
-      triggerSocketProbe?.(1500, { timeoutMs: 450, prewarmStandby: true });
+      triggerSocketProbe?.(1500, { timeoutMs: 200, prewarmStandby: true });
     });
     window.addEventListener?.('pageshow', () => {
-      triggerSocketProbe?.(1500, { timeoutMs: 450, prewarmStandby: true });
+      wakeControlBackoff?.();
+      triggerSocketProbe?.(1500, { timeoutMs: 200, prewarmStandby: true });
     });
     document.addEventListener?.('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
         const hiddenMs = hiddenAt ? Date.now() - hiddenAt : 0;
         hiddenAt = 0;
         retryCount = 0;
+        if (hiddenMs >= 3000) wakeControlBackoff?.();
         checkRelayHealth();
-        triggerSocketProbe?.(1500, { timeoutMs: hiddenMs >= 8000 ? 250 : 450, prewarmStandby: hiddenMs >= 8000 });
+        triggerSocketProbe?.(1500, { timeoutMs: hiddenMs >= 5000 ? 200 : 450, prewarmStandby: hiddenMs >= 5000 });
       } else {
         hiddenAt = Date.now();
         clearRetryTimer();

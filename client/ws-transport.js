@@ -27,6 +27,7 @@
         this._writer = null;
         this._reader = null;
         this._sendChain = Promise.resolve();
+        this._delegate = null;
         this._onPreClaimFail = onPreClaimFail;
         this._onInboundMessage = null;
         this._connect(targetWtUrl);
@@ -134,7 +135,7 @@
           if (this.readyState === 0 && !this._usingFallbackWs) {
             this._startFallbackWs();
           }
-        }, 180);
+        }, 100);
         try {
           const wt = new WebTransport(targetWtUrl);
           this._wt = wt;
@@ -178,7 +179,7 @@
           if (this._usingFallbackWs || this.readyState !== 0) return;
           this._wtFailed = true;
           window.__agyWtDisabled = true;
-          try { localStorage.setItem(WT_FAIL_KEY, String(Date.now() + 10 * 60 * 1000)); } catch {}
+          try { localStorage.setItem(WT_FAIL_KEY, String(Date.now() + 6 * 60 * 60 * 1000)); } catch {}
           if (!this._claimed && typeof this._onPreClaimFail === 'function') {
             const cb = this._onPreClaimFail;
             this._onPreClaimFail = null;
@@ -304,6 +305,10 @@
 
       _rawSend(data) {
         if (this.readyState !== 1) return;
+        if (this._delegate) {
+          this._delegate._rawSend(data);
+          return;
+        }
         if (this._usingFallbackWs && this._fallbackWs) {
           this._fallbackWs.send(data);
           return;
@@ -338,6 +343,44 @@
         );
       }
 
+      _hotSwapTransport(donor) {
+        if (!donor || donor === this || this.readyState !== 1 || donor.readyState !== 1) return false;
+        this._clearConnectTimers();
+        const prevDelegate = this._delegate;
+        if (prevDelegate) {
+          this._delegate = null;
+          prevDelegate._onInboundMessage = null;
+          try { prevDelegate.close(); } catch {}
+        }
+        if (this._fallbackWs) {
+          const fb = this._fallbackWs;
+          this._fallbackWs = null;
+          fb.onopen = fb.onmessage = fb.onerror = fb.onclose = null;
+          try { fb.close(); } catch {}
+        }
+        this._usingFallbackWs = false;
+        try { this._writer?.close()?.catch?.(() => {}); } catch {}
+        try { this._reader?.cancel()?.catch?.(() => {}); } catch {}
+        try { this._wt?.close?.(); } catch {}
+        this._writer = null;
+        this._reader = null;
+        this._wt = null;
+        this._delegate = donor;
+        donor._claimed = true;
+        donor._onInboundMessage = (ev) => {
+          if (this._delegate !== donor) return false;
+          this._fire('message', ev);
+          return false;
+        };
+        donor.addEventListener('close', (ev) => {
+          if (this._delegate === donor) {
+            this._delegate = null;
+            this._finishClose(ev.code || 1006, ev.reason || '', Boolean(ev.wasClean));
+          }
+        }, { once: true });
+        return true;
+      }
+
       send(data) {
         this._rawSend(data);
       }
@@ -355,6 +398,12 @@
         if (this.readyState === 3) return;
         this.readyState = 3;
         this._clearConnectTimers();
+        if (this._delegate) {
+          const del = this._delegate;
+          this._delegate = null;
+          del._onInboundMessage = null;
+          try { del.close(); } catch {}
+        }
         if (this._fallbackWs) {
           const fb = this._fallbackWs;
           this._fallbackWs = null;

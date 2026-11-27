@@ -22,12 +22,15 @@
   let triggerConvoPrefetch = null;
   let prewarmStandbyControlSocket = null;
   let prepareNotificationCascade = null;
+  let wakeControlBackoff = null;
   if (
     window === window.top &&
     typeof window.WebSocket === 'function' &&
     (location.protocol === 'https:' || location.protocol === 'http:')
   ) {
     const NativeWebSocket = window.WebSocket;
+    const nativeSetTimeout = window.setTimeout.bind(window);
+    const nativeClearTimeout = window.clearTimeout.bind(window);
     const earlyWsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/connect-websocket';
     const wtUrl = 'https://' + location.host + '/wt-websocket';
     const canUseWT =
@@ -37,11 +40,15 @@
       !/[?&]no-wt=1(?:&|$)/.test(location.search);
 
     const WT_FAIL_KEY = 'agy_relay_wt_fail_until';
-    try {
-      if (Number(localStorage.getItem(WT_FAIL_KEY) || 0) > Date.now()) {
-        window.__agyWtDisabled = true;
-      }
-    } catch {}
+    if (/[?&]wt=1(?:&|$)/.test(location.search)) {
+      try { localStorage.removeItem(WT_FAIL_KEY); } catch {}
+    } else {
+      try {
+        if (Number(localStorage.getItem(WT_FAIL_KEY) || 0) > Date.now()) {
+          window.__agyWtDisabled = true;
+        }
+      } catch {}
+    }
 
     const CONVO_UUID_RE = /^\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:$|[/?#])/i;
     const bootMatch = CONVO_UUID_RE.exec(location.pathname || '');
@@ -52,6 +59,8 @@
     const CONVO_CACHE_TTL_MS = 10 * 60 * 1000;
     const convoSnapshotCache = new Map();
     const activeStateStreams = new Map();
+    const openStateStreams = new Map();
+    const openControlStreams = new Map();
     const prefetchStreams = new Map();
     let preSeq = 0;
     let bootUserStatus = null;
@@ -64,18 +73,58 @@
 
     const WebTransportWebSocket = createWebTransportWebSocketClass({ NativeWebSocket, WT_FAIL_KEY, textDecoder, textEncoder });
 
-
-
     let activeControlSocket = null;
     let standbySocket = null;
     let standbyTimer = 0;
     let lastInboundAt = 0;
+    let lastSocketCloseAt = 0;
     let probeTimer = 0;
     let probeSeq = 0;
 
+    const BACKOFF_DELAYS = new Set([1000, 2000, 4000, 8000, 16000, 30000]);
+    const trackedBackoffTimers = new Map();
+
+    const wakeBackoffTimers = () => {
+      if (trackedBackoffTimers.size === 0) return;
+      const snapshot = [...trackedBackoffTimers.entries()];
+      trackedBackoffTimers.clear();
+      for (const [id, entry] of snapshot) {
+        try { nativeClearTimeout(id); } catch {}
+        queueMicrotask(() => {
+          try { entry.fn(...entry.args); } catch {}
+        });
+      }
+    };
+    wakeControlBackoff = wakeBackoffTimers;
+
+    window.setTimeout = function(fn, delay, ...args) {
+      const ms = Number(delay);
+      const trackable =
+        typeof fn === 'function' &&
+        fn.length === 0 &&
+        BACKOFF_DELAYS.has(ms) &&
+        (!activeControlSocket || activeControlSocket.readyState !== 1 || Date.now() - lastSocketCloseAt < 150);
+      if (!trackable) {
+        return nativeSetTimeout(fn, delay, ...args);
+      }
+      let timerId = 0;
+      const wrapped = (...cbArgs) => {
+        trackedBackoffTimers.delete(timerId);
+        return fn(...cbArgs);
+      };
+      timerId = nativeSetTimeout(wrapped, delay, ...args);
+      trackedBackoffTimers.set(timerId, { fn, args });
+      return timerId;
+    };
+
+    window.clearTimeout = function(id) {
+      trackedBackoffTimers.delete(id);
+      return nativeClearTimeout(id);
+    };
+
     const clearStandby = (closeUnused = false) => {
       if (standbyTimer) {
-        clearTimeout(standbyTimer);
+        nativeClearTimeout(standbyTimer);
         standbyTimer = 0;
       }
       if (closeUnused && standbySocket && !standbySocket._claimed) {
@@ -99,7 +148,7 @@
     const cancelPrefetchEntry = (sock, preId) => {
       const info = prefetchStreams.get(preId);
       if (!info) return;
-      if (info.timer) clearTimeout(info.timer);
+      if (info.timer) nativeClearTimeout(info.timer);
       prefetchStreams.delete(preId);
       if (sock && sock.readyState === 1) {
         try { sock._rawSend(JSON.stringify({ streamId: preId, type: 'cancel' })); } catch {}
@@ -114,7 +163,7 @@
       const csrf = window.__APP_CONFIG__?.csrfToken || '';
       if (!csrf) return;
       const preId = '__agy_pre_sum';
-      const timer = setTimeout(() => {
+      const timer = nativeSetTimeout(() => {
         if (bootSumState && bootSumState.sock === sock && !bootSumState.adoptedId) {
           bootSumState = null;
           if (sock.readyState === 1) {
@@ -149,14 +198,14 @@
           payload: {},
         }));
       } catch {
-        clearTimeout(timer);
+        nativeClearTimeout(timer);
         bootSumState = null;
       }
     };
 
     const flushDeferredSummaries = () => {
       if (deferredSumTimer) {
-        clearTimeout(deferredSumTimer);
+        nativeClearTimeout(deferredSumTimer);
         deferredSumTimer = 0;
       }
       const targetSock = deferredSumSock;
@@ -166,10 +215,10 @@
       }
     };
 
-    const clearSocketTracking = (sock) => {
+    const clearPrefetchAndAliasTracking = (sock) => {
       if (deferredSumSock === sock) {
         if (deferredSumTimer) {
-          clearTimeout(deferredSumTimer);
+          nativeClearTimeout(deferredSumTimer);
           deferredSumTimer = 0;
         }
         deferredSumSock = null;
@@ -179,18 +228,28 @@
       }
       for (const [pid, info] of prefetchStreams.entries()) {
         if (info.sock === sock) {
-          if (info.timer) clearTimeout(info.timer);
+          if (info.timer) nativeClearTimeout(info.timer);
           if (info.adoptedId) reverseAliases.delete(info.adoptedId);
           streamAliases.delete(pid);
           prefetchStreams.delete(pid);
         }
       }
       if (bootSumState && bootSumState.sock === sock) {
-        if (bootSumState.timer) clearTimeout(bootSumState.timer);
-        if (bootSumState.deferredTimer) clearTimeout(bootSumState.deferredTimer);
+        if (bootSumState.timer) nativeClearTimeout(bootSumState.timer);
+        if (bootSumState.deferredTimer) nativeClearTimeout(bootSumState.deferredTimer);
         if (bootSumState.adoptedId) reverseAliases.delete(bootSumState.adoptedId);
         streamAliases.delete('__agy_pre_sum');
         bootSumState = null;
+      }
+    };
+
+    const clearSocketTracking = (sock) => {
+      clearPrefetchAndAliasTracking(sock);
+      for (const [sid, entry] of openStateStreams.entries()) {
+        if (entry.sock === sock) openStateStreams.delete(sid);
+      }
+      for (const [sid, entry] of openControlStreams.entries()) {
+        if (entry.sock === sock) openControlStreams.delete(sid);
       }
     };
 
@@ -216,9 +275,9 @@
       if (!bootSumState) {
         const deferMs = Number(bootOpts.deferSummariesMs || 0);
         if (deferMs > 0) {
-          if (deferredSumTimer) clearTimeout(deferredSumTimer);
+          if (deferredSumTimer) nativeClearTimeout(deferredSumTimer);
           deferredSumSock = sock;
-          deferredSumTimer = setTimeout(flushDeferredSummaries, deferMs);
+          deferredSumTimer = nativeSetTimeout(flushDeferredSummaries, deferMs);
         } else {
           sendSummariesPrefetch(sock);
         }
@@ -238,7 +297,7 @@
         if (info.sock === sock && !info.adoptedId) cancelPrefetchEntry(sock, pid);
       }
       const preId = '__agy_pre_' + (++preSeq);
-      const timer = setTimeout(() => cancelPrefetchEntry(sock, preId), 4000);
+      const timer = nativeSetTimeout(() => cancelPrefetchEntry(sock, preId), 4000);
       prefetchStreams.set(preId, { cascadeId, sock, timer, adoptedId: null, cached: false });
       try {
         sock._rawSend(JSON.stringify({
@@ -357,12 +416,12 @@
           sock._dispatchDirectMessage(JSON.stringify({ streamId, type: 'data', payload: { updates: chunk } }));
         }
         if (offset < deferredKeys.length && bootSumState === state && state.adoptedId === streamId && sock.readyState === 1) {
-          state.deferredTimer = setTimeout(pumpChunk, 16);
+          state.deferredTimer = nativeSetTimeout(pumpChunk, 16);
         } else {
           state.deferredUpdates = null;
         }
       };
-      state.deferredTimer = setTimeout(pumpChunk, 80);
+      state.deferredTimer = nativeSetTimeout(pumpChunk, 80);
     };
 
     const attachControlHandlers = (sock) => {
@@ -372,7 +431,7 @@
         if (activeControlSocket === sock) {
           lastInboundAt = Date.now();
           if (probeTimer) {
-            clearTimeout(probeTimer);
+            nativeClearTimeout(probeTimer);
             probeTimer = 0;
           }
           clearStandby(true);
@@ -453,7 +512,7 @@
               } else if (parsed.type === 'end') {
                 bootSumState.ended = true;
                 if (bootSumState.timer) {
-                  clearTimeout(bootSumState.timer);
+                  nativeClearTimeout(bootSumState.timer);
                   bootSumState.timer = 0;
                 }
               }
@@ -475,6 +534,8 @@
                   prefetchStreams.delete(parsed.streamId);
                   streamAliases.delete(parsed.streamId);
                   reverseAliases.delete(info.adoptedId);
+                  openStateStreams.delete(info.adoptedId);
+                  openControlStreams.delete(info.adoptedId);
                 }
                 parsed.streamId = info.adoptedId;
                 sock._dispatchDirectMessage(JSON.stringify(parsed));
@@ -492,20 +553,26 @@
                 }
                 cancelPrefetchEntry(info.sock, parsed.streamId);
               } else if (parsed.type === 'end') {
-                if (info.timer) clearTimeout(info.timer);
+                if (info.timer) nativeClearTimeout(info.timer);
                 prefetchStreams.delete(parsed.streamId);
               }
               return false;
             }
           } catch {}
         }
-        if (activeStateStreams.size > 0 && raw.includes('"type":"data"')) {
+        if ((activeStateStreams.size > 0 || openControlStreams.size > 0 || openStateStreams.size > 0) && raw.includes('"type":"')) {
           try {
             const parsed = JSON.parse(raw);
-            const entry = parsed?.streamId ? activeStateStreams.get(parsed.streamId) : null;
-            if (entry && !entry.captured && parsed.payload) {
-              entry.captured = true;
-              cacheConvoSnapshot(entry.cascadeId, parsed.payload);
+            if (parsed?.type === 'data') {
+              const entry = parsed.streamId ? activeStateStreams.get(parsed.streamId) : null;
+              if (entry && !entry.captured && parsed.payload) {
+                entry.captured = true;
+                cacheConvoSnapshot(entry.cascadeId, parsed.payload);
+                activeStateStreams.delete(parsed.streamId);
+              }
+            } else if (parsed?.type === 'end' && parsed.streamId) {
+              openControlStreams.delete(parsed.streamId);
+              openStateStreams.delete(parsed.streamId);
               activeStateStreams.delete(parsed.streamId);
             }
           } catch {}
@@ -520,8 +587,9 @@
         }
         if (activeControlSocket === sock) {
           activeControlSocket = null;
+          lastSocketCloseAt = Date.now();
           if (probeTimer) {
-            clearTimeout(probeTimer);
+            nativeClearTimeout(probeTimer);
             probeTimer = 0;
           }
         }
@@ -535,13 +603,14 @@
     const prewarmStandbySocket = (cascadeId = '') => {
       if (standbySocket || earlyWt) return;
       const fb = createControlSocket(canUseWT && !window.__agyWtDisabled);
-      if (cascadeId) {
-        fb.addEventListener('open', () => {
-          startConvoPrefetch(fb, cascadeId);
-        }, { once: true });
-      }
+      fb.addEventListener('open', () => {
+        if (cascadeId) startConvoPrefetch(fb, cascadeId);
+        if (!activeControlSocket || activeControlSocket.readyState !== 1) {
+          wakeBackoffTimers();
+        }
+      }, { once: true });
       standbySocket = fb;
-      standbyTimer = setTimeout(() => {
+      standbyTimer = nativeSetTimeout(() => {
         standbyTimer = 0;
         if (standbySocket === fb && !fb._claimed) {
           standbySocket = null;
@@ -565,9 +634,24 @@
         return;
       }
       const timeoutMs = typeof opts.timeoutMs === 'number' ? opts.timeoutMs : 450;
-      probeTimer = setTimeout(() => {
+      probeTimer = nativeSetTimeout(() => {
         probeTimer = 0;
         if (activeControlSocket !== sock || sock.readyState !== 1) return;
+        if (standbySocket && standbySocket.readyState === 1 && typeof sock._hotSwapTransport === 'function') {
+          const donor = standbySocket;
+          standbySocket = null;
+          clearStandby(false);
+          clearPrefetchAndAliasTracking(sock);
+          if (sock._hotSwapTransport(donor)) {
+            lastInboundAt = Date.now();
+            for (const entry of openControlStreams.values()) {
+              if (entry.sock === sock) {
+                try { sock._rawSend(entry.rawStart); } catch {}
+              }
+            }
+            return;
+          }
+        }
         try { sock.close(4000, 'stale-probe-timeout'); } catch {}
         if (typeof sock._finishClose === 'function') {
           try { sock._finishClose(1006, 'stale-probe-timeout', false); } catch {}
@@ -586,12 +670,23 @@
     };
 
     prepareNotificationCascade = (cascadeId) => {
+      wakeBackoffTimers();
       if (cascadeId) {
         convoSnapshotCache.delete(cascadeId);
-        agyIdbCache.getConvoAsync(cascadeId, { bypassMemory: true }).catch(() => null);
+        agyIdbCache
+          .getConvoAsync(cascadeId, { bypassMemory: true })
+          .then((fresh) => {
+            if (!fresh) return;
+            for (const [sid, entry] of openStateStreams.entries()) {
+              if (entry.cascadeId === cascadeId && entry.sock?.readyState === 1) {
+                entry.sock._dispatchDirectMessage(JSON.stringify({ streamId: sid, type: 'data', payload: fresh }));
+              }
+            }
+          })
+          .catch(() => null);
         triggerConvoPrefetch(cascadeId);
       }
-      probeActiveSocket(1500, { timeoutMs: 250, prewarmStandby: true, cascadeId });
+      probeActiveSocket(1500, { timeoutMs: 200, prewarmStandby: true, cascadeId });
     };
 
     const trackControlSocket = (sock) => {
@@ -599,7 +694,7 @@
       attachControlHandlers(sock);
       if (activeControlSocket === sock) return sock;
       if (probeTimer) {
-        clearTimeout(probeTimer);
+        nativeClearTimeout(probeTimer);
         probeTimer = 0;
       }
       activeControlSocket = sock;
@@ -612,12 +707,28 @@
         sock.send = (data) => {
           if (typeof data === 'string') {
             if (data.includes('"type":"start"')) {
+              let startParsed = null;
+              try {
+                startParsed = JSON.parse(data);
+                if (
+                  startParsed?.streamId &&
+                  (startParsed.stream === true ||
+                    data.includes('StreamAgentStateUpdates') ||
+                    data.includes('JetboxSubscribeToSummaries'))
+                ) {
+                  openControlStreams.set(startParsed.streamId, {
+                    rawStart: data,
+                    cascadeId: startParsed?.payload?.conversationId || '',
+                    sock,
+                  });
+                }
+              } catch {}
               if (data.includes('/JetboxSubscribeToSummaries')) {
                 flushDeferredSummaries();
               }
               if (data.includes('/GetUserStatus')) {
                 try {
-                  const parsed = JSON.parse(data);
+                  const parsed = startParsed || JSON.parse(data);
                   const streamId = parsed?.streamId;
                   if (streamId && (!parsed.payload || Object.keys(parsed.payload).length === 0)) {
                     let cachedUser = null;
@@ -646,12 +757,12 @@
                 !bootSumState.ended
               ) {
                 try {
-                  const parsed = JSON.parse(data);
+                  const parsed = startParsed || JSON.parse(data);
                   const streamId = parsed?.streamId;
                   if (streamId && (!parsed.payload || Object.keys(parsed.payload).length === 0)) {
                     bootSumState.adoptedId = streamId;
                     if (bootSumState.timer) {
-                      clearTimeout(bootSumState.timer);
+                      nativeClearTimeout(bootSumState.timer);
                       bootSumState.timer = 0;
                     }
                     streamAliases.set('__agy_pre_sum', streamId);
@@ -700,10 +811,11 @@
                 } catch {}
               } else if (data.includes('StreamAgentStateUpdates')) {
                 try {
-                  const parsed = JSON.parse(data);
+                  const parsed = startParsed || JSON.parse(data);
                   const streamId = parsed?.streamId;
                   const cascadeId = parsed?.payload?.conversationId;
                   if (streamId && cascadeId) {
+                    openStateStreams.set(streamId, { cascadeId, sock });
                     let adoptedPreId = null;
                     const boundsStart = parsed?.payload?.initialStepsPageBounds?.startIndex;
                     const stdBounds = !parsed?.payload?.initialStepsPageBounds || boundsStart === -50;
@@ -712,7 +824,7 @@
                         if (info.sock === sock && info.cascadeId === cascadeId && !info.adoptedId) {
                           info.adoptedId = streamId;
                           if (info.timer) {
-                            clearTimeout(info.timer);
+                            nativeClearTimeout(info.timer);
                             info.timer = 0;
                           }
                           streamAliases.set(pid, streamId);
@@ -751,19 +863,21 @@
               try {
                 const parsed = JSON.parse(data);
                 if (parsed?.streamId) {
+                  openControlStreams.delete(parsed.streamId);
+                  openStateStreams.delete(parsed.streamId);
                   activeStateStreams.delete(parsed.streamId);
                   if (reverseAliases.has(parsed.streamId)) {
                     const preId = reverseAliases.get(parsed.streamId);
                     reverseAliases.delete(parsed.streamId);
                     streamAliases.delete(preId);
                     if (bootSumState && bootSumState.adoptedId === parsed.streamId) {
-                      if (bootSumState.timer) clearTimeout(bootSumState.timer);
-                      if (bootSumState.deferredTimer) clearTimeout(bootSumState.deferredTimer);
+                      if (bootSumState.timer) nativeClearTimeout(bootSumState.timer);
+                      if (bootSumState.deferredTimer) nativeClearTimeout(bootSumState.deferredTimer);
                       bootSumState = null;
                     }
                     if (prefetchStreams.has(preId)) {
                       const preInfo = prefetchStreams.get(preId);
-                      if (preInfo?.timer) clearTimeout(preInfo.timer);
+                      if (preInfo?.timer) nativeClearTimeout(preInfo.timer);
                       prefetchStreams.delete(preId);
                     }
                     return sock._rawSend(JSON.stringify({ ...parsed, streamId: preId }));
@@ -782,7 +896,7 @@
     let earlyCleanupTimer = 0;
     const clearEarlyTimer = () => {
       if (earlyCleanupTimer) {
-        clearTimeout(earlyCleanupTimer);
+        nativeClearTimeout(earlyCleanupTimer);
         earlyCleanupTimer = 0;
       }
     };
@@ -796,7 +910,7 @@
         startBootPrefetches(earlyWt);
       }
     }, { once: true });
-    earlyCleanupTimer = setTimeout(() => {
+    earlyCleanupTimer = nativeSetTimeout(() => {
       earlyCleanupTimer = 0;
       if (earlyWt && !earlyWt._claimed) {
         const stale = earlyWt;

@@ -1,4 +1,5 @@
-const CACHE_NAME = 'agy-relay-static-v12';
+const CACHE_NAME = 'agy-relay-shell-v13';
+const ASSET_CACHE_NAME = 'agy-relay-assets-v1';
 const APP_SHELL_KEY = '/__agy_app_shell';
 const CONVO_IDB_NAME = 'agy-relay-cache-v1';
 const CONVO_IDB_STORE = 'snapshots';
@@ -44,15 +45,38 @@ self.addEventListener('install', (event) => {
 });
 
 self.addEventListener('activate', (event) => {
-  event.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k))),
-    ).then(() => self.clients.claim()).then(() => {
-      caches.open(CACHE_NAME).then((cache) =>
-        cache.match(APP_SHELL_KEY).then((hit) => hit || revalidateAppShell(cache, null)),
-      ).catch(() => {});
-    }),
-  );
+  event.waitUntil((async () => {
+    const keys = await caches.keys();
+    const oldKeys = keys.filter((k) => k !== CACHE_NAME && k !== ASSET_CACHE_NAME);
+    if (oldKeys.length > 0) {
+      try {
+        const assetCache = await caches.open(ASSET_CACHE_NAME);
+        for (const k of oldKeys) {
+          try {
+            const oldCache = await caches.open(k);
+            const reqs = typeof oldCache.keys === 'function' ? await oldCache.keys() : [];
+            for (const r of reqs) {
+              try {
+                const u = new URL(r.url);
+                if (u.searchParams.has('v')) {
+                  const existing = await assetCache.match(r);
+                  if (!existing) {
+                    const hit = await oldCache.match(r);
+                    if (hit) await assetCache.put(r, hit);
+                  }
+                }
+              } catch {}
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+    await Promise.all(oldKeys.map((k) => caches.delete(k)));
+    await self.clients.claim();
+    caches.open(CACHE_NAME).then((cache) =>
+      cache.match(APP_SHELL_KEY).then((hit) => hit || revalidateAppShell(cache, null)),
+    ).catch(() => {});
+  })());
 });
 
 function writeIdbSnapshot(key, data) {
@@ -382,23 +406,26 @@ self.addEventListener('fetch', (event) => {
   const cacheKey = hasVersion ? url.pathname + url.search : url.pathname;
 
   event.respondWith((async () => {
-    const cache = await caches.open(CACHE_NAME);
-    const cached = await cache.match(cacheKey);
-
     if (hasVersion) {
+      const assetCache = await caches.open(ASSET_CACHE_NAME);
+      const cached = await assetCache.match(cacheKey);
       if (cached) return cached;
       try {
         const resp = await fetch(req);
         if (resp && resp.status === 200) {
-          await cache.put(cacheKey, resp.clone());
-          event.waitUntil(pruneOlderVersions(cache, url.pathname, cacheKey));
+          await assetCache.put(cacheKey, resp.clone());
+          event.waitUntil(pruneOlderVersions(assetCache, url.pathname, cacheKey));
         }
         return resp;
       } catch {
-        const fallback = await cache.match(url.pathname);
+        const shellCache = await caches.open(CACHE_NAME);
+        const fallback = await shellCache.match(url.pathname);
         return fallback || Response.error();
       }
     }
+
+    const cache = await caches.open(CACHE_NAME);
+    const cached = await cache.match(cacheKey);
 
     const revalidate = (async () => {
       const result = await fetchWithRevalidate(cache, url.pathname, cached, 0);
