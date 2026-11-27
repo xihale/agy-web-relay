@@ -1,0 +1,274 @@
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  background: #0b0b0f;
+}
+
+@media (prefers-color-scheme: light) {
+  html {
+    background: #ffffff;
+  }
+}
+
+html, body {
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+  overflow-x: clip;
+}
+
+#root {
+  box-sizing: border-box;
+  width: 100%;
+  height: 100dvh;
+  height: var(--agy-vvh, 100dvh);
+  min-height: 0;
+  overflow-x: clip;
+}
+
+#root:empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #0b0b0f;
+}
+
+#root:empty::before {
+  content: "";
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.14);
+  border-top-color: rgba(122, 162, 247, 0.9);
+  animation: agy-boot-spin 0.75s linear infinite;
+}
+
+@keyframes agy-boot-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-color-scheme: light) {
+  #root:empty {
+    background: #ffffff;
+  }
+
+  #root:empty::before {
+    border-color: rgba(0, 0, 0, 0.12);
+    border-top-color: rgba(0, 122, 204, 0.85);
+  }
+}
+
+/* Keep the app wrapper bound to #root (including --agy-vvh and horizontal safe areas) */
+#root > .h-\[100dvh\] {
+  width: 100%;
+  height: 100%;
+}
+
+@media (pointer: coarse) {
+  button, a, [role="button"] {
+    touch-action: manipulation;
+  }
+
+  /* Prevent mobile browser auto-zoom on focus */
+  input,
+  textarea,
+  select,
+  [contenteditable="true"],
+  [contenteditable=""],
+  [contenteditable="plaintext-only"] {
+    font-size: max(16px, 1em) !important;
+  }
+
+  /* Antigravity natively applies safe-area-inset-top/bottom inside its header & composer;
+     only guard horizontal notch/cutout insets here so top/bottom aren't double-padded or clipped. */
+  #root {
+    padding:
+      0px
+      env(safe-area-inset-right, 0px)
+      0px
+      env(safe-area-inset-left, 0px);
+  }
+}
+
+@media (max-width: 768px) {
+  main, article, section {
+    min-width: 0;
+  }
+
+  pre, table {
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  table {
+    display: block;
+  }
+
+  pre code {
+    white-space: pre;
+  }
+
+  a, code {
+    overflow-wrap: anywhere;
+  }
+
+  img, video {
+    max-width: 100%;
+    height: auto;
+  }
+}
+
+#agy-relay-net-banner,
+#agy-relay-push-banner {
+  position: fixed;
+  top: calc(env(safe-area-inset-top, 0px) + 8px);
+  left: 50%;
+  max-width: calc(100vw - 24px);
+  box-sizing: border-box;
+  z-index: 2147483647;
+  padding: 6px 12px;
+  border-radius: 10px;
+  background: var(--card, #191919);
+  color: var(--foreground, #cccccc);
+  border: 1px solid var(--card-border, var(--border, #222222));
+  font: 500 12px/1.4 var(--font-sans, system-ui, -apple-system, sans-serif);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-50%) translateY(-10px);
+  transition: opacity 180ms ease, transform 180ms ease;
+}
+#agy-relay-push-banner {
+  z-index: 2147483646;
+}
+#agy-relay-net-banner[data-visible="1"],
+#agy-relay-push-banner[data-visible="1"] {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(-50%) translateY(0);
+}
+#agy-relay-net-banner span,
+#agy-relay-push-banner span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#agy-relay-net-banner button,
+#agy-relay-push-banner button,
+#agy-relay-push-banner a {
+  flex-shrink: 0;
+  cursor: pointer;
+  background: var(--primary, #007acc);
+  color: var(--primary-foreground, #ffffff);
+  border: 0;
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  text-decoration: none;
+}
+#agy-relay-push-banner button.sec {
+  background: var(--secondary, #272727);
+  color: var(--secondary-foreground, #9d9d9d);
+}
+
+#agy-relay-file-sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 6500;
+  background: var(--scrim, rgba(0, 0, 0, 0.3));
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 0;
+  box-sizing: border-box;
+  opacity: 0;
+  transition: opacity 200ms ease;
+}
+#agy-relay-file-sheet-backdrop[data-visible="1"] {
+  opacity: 1;
+}
+#agy-relay-file-sheet {
+  width: 100%;
+  max-width: 560px;
+  box-sizing: border-box;
+  background: var(--background, #101010);
+  color: var(--foreground, #cccccc);
+  border-top: 1px solid var(--border, #191919);
+  border-left: 1px solid var(--border, #191919);
+  border-right: 1px solid var(--border, #191919);
+  border-radius: 16px 16px 0 0;
+  box-shadow: 0 -16px 40px rgba(0, 0, 0, 0.45);
+  padding: 0 8px calc(10px + env(safe-area-inset-bottom, 0px));
+  display: flex;
+  flex-direction: column;
+  transform: translateY(100%);
+  transition: transform 240ms cubic-bezier(0.16, 1, 0.3, 1);
+  font-family: var(--font-sans, system-ui, -apple-system, sans-serif);
+}
+#agy-relay-file-sheet-backdrop[data-visible="1"] #agy-relay-file-sheet {
+  transform: translateY(0);
+}
+.agy-relay-sheet-grabber {
+  display: flex;
+  justify-content: center;
+  padding: 8px 0 4px;
+  flex-shrink: 0;
+  touch-action: none;
+}
+.agy-relay-sheet-grabber-bar {
+  width: 36px;
+  height: 4px;
+  border-radius: 9999px;
+  background: rgba(204, 204, 204, 0.2);
+  background: color-mix(in srgb, var(--foreground, #cccccc) 20%, transparent);
+}
+.agy-relay-sheet-group {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 4px;
+}
+.agy-relay-sheet-title {
+  padding: 8px 8px 4px;
+  font-size: 13px;
+  line-height: 1.3;
+  font-weight: 500;
+  color: var(--muted-foreground, #6e6e6e);
+  text-align: left;
+  user-select: none;
+}
+.agy-relay-sheet-btn {
+  width: 100%;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 8px;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  color: var(--secondary-foreground, #9d9d9d);
+  font: 400 15px/1.35 var(--font-sans, system-ui, -apple-system, sans-serif);
+  text-align: left;
+  cursor: pointer;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.agy-relay-sheet-btn svg {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+}
+.agy-relay-sheet-btn:active,
+.agy-relay-sheet-btn:focus-visible {
+  background: var(--secondary, #272727);
+  color: var(--foreground, #cccccc);
+  outline: none;
+}
