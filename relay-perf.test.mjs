@@ -10,6 +10,8 @@ import vm from 'node:vm';
 import { createFastUsageReader, injectMobileHead, shouldPatchSpaHtml } from './agy-web-relay.mjs';
 import { createConvoSnapshotCache } from './lib/convo-snapshot.mjs';
 import { MOBILE_CSS, MOBILE_JS, SW_JS } from './mobile-assets.mjs';
+import { createWebPushManager } from './web-push.mjs';
+import { deflateWsPayload, inflateWsPayload } from './ws-deflate-bridge.mjs';
 
 test('SW_JS and MOBILE_JS parse cleanly', () => {
   assert.doesNotThrow(() => new vm.Script(SW_JS, { filename: 'sw.js' }));
@@ -1629,6 +1631,231 @@ test('MOBILE_JS /c/<uuid> prioritizes StreamAgentStateUpdates, adopts convo pref
   } finally {
     for (const id of timers) clearTimeout(id);
     for (const id of intervals) clearInterval(id);
+  }
+});
+
+test('injectMobileHead places inline mobile script before blocking stylesheets', () => {
+  const html =
+    '<!doctype html><html><head><script>window.__APP_CONFIG__ = {"csrfToken":"abc"};</script>' +
+    '<link rel="stylesheet" href="/jetbox.css" /><script src="/main.js"></script></head><body></body></html>';
+  const patched = injectMobileHead(html, { '/jetbox.css': 'v1', '/main.js': 'v2' }, { css: 'body{}', js: 'console.log(1);' });
+  const cfgIdx = patched.indexOf('window.__APP_CONFIG__');
+  const mobileIdx = patched.indexOf('<script data-agy-relay="mobile-js">');
+  const cssLinkIdx = patched.indexOf('<link rel="stylesheet" href="/jetbox.css?v=v1"');
+  assert.ok(cfgIdx > 0 && mobileIdx > cfgIdx, 'mobile-js should appear after __APP_CONFIG__');
+  assert.ok(cssLinkIdx > mobileIdx, 'mobile-js should appear before blocking jetbox.css stylesheet');
+});
+
+test('ws-deflate-bridge pooled deflateWsPayload and inflateWsPayload roundtrip concurrently across sizes', async () => {
+  const smallA = Buffer.from(JSON.stringify({ msg: 'hello-small', seq: 1 }), 'utf8');
+  const smallB = Buffer.from(JSON.stringify({ msg: 'hello-small-2', seq: 2 }), 'utf8');
+  const largeA = Buffer.from(JSON.stringify({ big: 'x'.repeat(72 * 1024), list: Array.from({ length: 200 }, (_, i) => i) }), 'utf8');
+  const largeB = Buffer.from(JSON.stringify({ big: 'y'.repeat(70 * 1024), tag: 'concurrent' }), 'utf8');
+
+  const [c1, c2, c3, c4] = await Promise.all([
+    deflateWsPayload(smallA, 3),
+    deflateWsPayload(largeA, 4),
+    deflateWsPayload(smallB, 3),
+    deflateWsPayload(largeB, 4),
+  ]);
+  const [d1, d2, d3, d4] = await Promise.all([
+    inflateWsPayload(c1),
+    inflateWsPayload(c2),
+    inflateWsPayload(c3),
+    inflateWsPayload(c4),
+  ]);
+  assert.equal(d1.toString('utf8'), smallA.toString('utf8'));
+  assert.equal(d2.toString('utf8'), largeA.toString('utf8'));
+  assert.equal(d3.toString('utf8'), smallB.toString('utf8'));
+  assert.equal(d4.toString('utf8'), largeB.toString('utf8'));
+});
+
+test('MOBILE_JS progressively chunks large summary snapshots without losing or clobbering updates', async () => {
+  const timers = new Set();
+  const intervals = new Set();
+  const trackTimeout = (fn, ms = 0, ...args) => {
+    const id = setTimeout(() => {
+      timers.delete(id);
+      fn(...args);
+    }, ms);
+    timers.add(id);
+    return id;
+  };
+  const trackClearTimeout = (id) => {
+    timers.delete(id);
+    clearTimeout(id);
+  };
+  const trackInterval = (fn, ms = 0, ...args) => {
+    const id = setInterval(fn, ms, ...args);
+    intervals.add(id);
+    return id;
+  };
+  const trackClearInterval = (id) => {
+    intervals.delete(id);
+    clearInterval(id);
+  };
+
+  const cid = '00000000-0000-4000-8000-000000000001';
+  const bigUpdates = {};
+  bigUpdates[cid] = { summary: 'boot-convo', lastModifiedTime: '2026-01-01T00:00:00Z' };
+  bigUpdates['active-1'] = { summary: 'active-item', notFullyIdle: true, lastModifiedTime: '2026-01-02T00:00:00Z' };
+  bigUpdates['sub-boot'] = { summary: 'child', trajectoryMetadata: { parentConversationId: cid }, lastModifiedTime: '2026-01-03T00:00:00Z' };
+  for (let i = 0; i < 317; i++) {
+    bigUpdates[`old-${i}`] = {
+      summary: `sum-${i}`,
+      lastModifiedTime: `2026-02-${String(1 + (i % 28)).padStart(2, '0')}T${String(Math.floor(i / 28)).padStart(2, '0')}:00:00Z`,
+    };
+  }
+
+  let rawSockRef = null;
+  class ChunkTestWS extends EventTarget {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
+    constructor(url) {
+      super();
+      this.url = url;
+      this.readyState = 0;
+      this.sent = [];
+      rawSockRef = this;
+      trackTimeout(() => {
+        if (this.readyState !== 0) return;
+        this.readyState = 1;
+        this.onopen?.(new Event('open'));
+        this.dispatchEvent(new Event('open'));
+      }, 2);
+    }
+    send(raw) {
+      this.sent.push(raw);
+      if (typeof raw === 'string' && raw.includes('"__agy_pre_sum"')) {
+        this.onmessage?.(new MessageEvent('message', {
+          data: JSON.stringify({ streamId: '__agy_pre_sum', type: 'data', payload: { updates: bigUpdates } }),
+        }));
+      }
+    }
+    close() {
+      this.readyState = 3;
+    }
+  }
+
+  const lsMap = new Map();
+  const sandbox = {
+    URL,
+    Event,
+    EventTarget,
+    MessageEvent,
+    CloseEvent: class CloseEvent extends Event {
+      constructor(type, init = {}) {
+        super(type);
+        this.code = init.code ?? 1000;
+      }
+    },
+    TextDecoder,
+    TextEncoder,
+    DecompressionStream: class {},
+    WebSocket: ChunkTestWS,
+    Response,
+    setTimeout: trackTimeout,
+    clearTimeout: trackClearTimeout,
+    setInterval: trackInterval,
+    clearInterval: trackClearInterval,
+    queueMicrotask,
+    requestAnimationFrame: (fn) => trackTimeout(fn, 0),
+    __APP_CONFIG__: { csrfToken: 'boot-csrf' },
+    localStorage: {
+      length: 0,
+      key: () => null,
+      getItem: (k) => (lsMap.has(k) ? lsMap.get(k) : null),
+      setItem: (k, v) => lsMap.set(k, String(v)),
+      removeItem: (k) => lsMap.delete(k),
+    },
+    navigator: {},
+    document: {
+      readyState: 'complete',
+      head: { appendChild: () => {} },
+      documentElement: { style: { setProperty: () => {}, removeProperty: () => {} }, appendChild: () => {} },
+      createElement: () => ({ setAttribute: () => {}, append: () => {} }),
+      addEventListener: () => {},
+      querySelector: () => null,
+      getElementById: () => null,
+      getElementsByTagName: () => [],
+      visibilityState: 'visible',
+    },
+    location: {
+      protocol: 'https:',
+      host: 'relay.example:8421',
+      origin: 'https://relay.example:8421',
+      href: `https://relay.example:8421/c/${cid}`,
+      pathname: `/c/${cid}`,
+      search: '',
+    },
+    fetch: async () => new Response('{}', { status: 200 }),
+    addEventListener: () => {},
+  };
+  sandbox.window = sandbox;
+  sandbox.top = sandbox;
+
+  try {
+    vm.runInNewContext(MOBILE_JS, sandbox);
+    await new Promise((r) => setTimeout(r, 15));
+    const sock = new sandbox.WebSocket('wss://relay.example:8421/connect-websocket');
+    const sumFrames = [];
+    sock.addEventListener('message', (ev) => {
+      const m = JSON.parse(ev.data);
+      if (m.streamId === 'real-sum' && m.type === 'data') sumFrames.push(m.payload);
+    });
+    sock.send(JSON.stringify({ streamId: 'real-sum', type: 'start', procedure: '/exa.language_server_pb.LanguageServerService/JetboxSubscribeToSummaries', stream: true, payload: {} }));
+
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(sumFrames.length, 1);
+    const firstKeys = Object.keys(sumFrames[0].updates || {});
+    assert.ok(firstKeys.length <= 60, `Expected <= 60 immediate summaries, got ${firstKeys.length}`);
+    assert.ok(sumFrames[0].updates[cid] && sumFrames[0].updates['active-1'] && sumFrames[0].updates['sub-boot']);
+
+    // Send live update for a deferred key before chunked timer fires -> must not be clobbered!
+    rawSockRef.onmessage(new MessageEvent('message', {
+      data: JSON.stringify({ streamId: '__agy_pre_sum', type: 'data', payload: { updates: { 'old-0': { summary: 'live-updated-0' } } } }),
+    }));
+
+    await new Promise((r) => setTimeout(r, 160));
+    assert.ok(sumFrames.length >= 3, `Expected >= 3 chunked frames, got ${sumFrames.length}`);
+    const merged = Object.create(null);
+    for (const frame of sumFrames) {
+      Object.assign(merged, frame.updates || {});
+    }
+    assert.equal(Object.keys(merged).length, 320);
+    assert.equal(merged['old-0'].summary, 'live-updated-0');
+  } finally {
+    for (const id of timers) clearTimeout(id);
+    for (const id of intervals) clearInterval(id);
+  }
+});
+
+test('web-push subscribe skips redundant disk writes for unchanged active subscription', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-push-noop-'));
+  const manager = createWebPushManager({ configDir: tmpDir, getTargetInfo: async () => null });
+  const ecdh = crypto.createECDH('prime256v1');
+  ecdh.generateKeys();
+  const sub = {
+    endpoint: 'https://fcm.googleapis.com/fcm/send/noop-test',
+    keys: {
+      p256dh: ecdh.getPublicKey().toString('base64url'),
+      auth: crypto.randomBytes(16).toString('base64url'),
+    },
+  };
+  try {
+    manager.subscribe({ subscription: sub, userAgent: 'Mozilla/5.0 Android Chrome' });
+    const statePath = path.join(tmpDir, 'web-push.json');
+    const t0 = new Date(Date.now() - 5000);
+    fs.utimesSync(statePath, t0, t0);
+    const beforeMtime = fs.statSync(statePath).mtimeMs;
+    manager.subscribe({ subscription: sub, userAgent: 'Mozilla/5.0 Android Chrome' });
+    const afterMtime = fs.statSync(statePath).mtimeMs;
+    assert.equal(afterMtime, beforeMtime);
+  } finally {
+    manager.dispose();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
 

@@ -32,9 +32,31 @@ import (
 const (
 	flagBinary        byte   = 0x01
 	flagDeflate       byte   = 0x02
-	deflateMinBytes          = 128
+	deflateMinBytes          = 256
 	maxWSMessageBytes uint32 = 64 * 1024 * 1024
 )
+
+type slicePool struct {
+	pool sync.Pool
+}
+
+func newSlicePool(size int) *slicePool {
+	return &slicePool{
+		pool: sync.Pool{
+			New: func() any {
+				return make([]byte, size)
+			},
+		},
+	}
+}
+
+func (p *slicePool) Get() []byte {
+	return p.pool.Get().([]byte)
+}
+
+func (p *slicePool) Put(b []byte) {
+	p.pool.Put(b)
+}
 
 func checkSameOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
@@ -71,34 +93,62 @@ func verifyBackendAuth(ctx context.Context, client *http.Client, backendOrigin s
 	return http.StatusOK
 }
 
-func bridgeWebTransportToWS(sess *webtransport.Session, backendWSURL string, r *http.Request) {
+func bridgeWebTransportToWS(sess *webtransport.Session, backendWSURL string, backendTLS *tls.Config, r *http.Request) {
 	defer sess.CloseWithError(0, "")
 
-	acceptCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	stream, err := sess.AcceptStream(acceptCtx)
-	cancel()
-	if err != nil {
-		return
+	type streamRes struct {
+		stream *webtransport.Stream
+		err    error
 	}
-	defer stream.Close()
+	type wsRes struct {
+		conn *websocket.Conn
+		err  error
+	}
 
-	dialer := websocket.Dialer{
-		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
-		HandshakeTimeout:  5 * time.Second,
-		EnableCompression: false,
-	}
-	upHeaders := http.Header{}
-	upHeaders.Set("Origin", "https://"+r.Host)
-	if auth := r.Header.Get("Authorization"); auth != "" {
-		upHeaders.Set("Authorization", auth)
-	}
-	if cookie := r.Header.Get("Cookie"); cookie != "" {
-		upHeaders.Set("Cookie", cookie)
-	}
-	upConn, _, err := dialer.DialContext(r.Context(), backendWSURL, upHeaders)
-	if err != nil {
+	streamCh := make(chan streamRes, 1)
+	wsCh := make(chan wsRes, 1)
+
+	go func() {
+		acceptCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		s, err := sess.AcceptStream(acceptCtx)
+		cancel()
+		streamCh <- streamRes{s, err}
+	}()
+
+	go func() {
+		dialer := websocket.Dialer{
+			TLSClientConfig:   backendTLS,
+			HandshakeTimeout:  5 * time.Second,
+			EnableCompression: false,
+		}
+		upHeaders := http.Header{}
+		upHeaders.Set("Origin", "https://"+r.Host)
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			upHeaders.Set("Authorization", auth)
+		}
+		if cookie := r.Header.Get("Cookie"); cookie != "" {
+			upHeaders.Set("Cookie", cookie)
+		}
+		conn, _, err := dialer.DialContext(r.Context(), backendWSURL, upHeaders)
+		wsCh <- wsRes{conn, err}
+	}()
+
+	sr := <-streamCh
+	wr := <-wsCh
+	if sr.err != nil {
+		if wr.conn != nil {
+			wr.conn.Close()
+		}
 		return
 	}
+	if wr.err != nil {
+		sr.stream.Close()
+		return
+	}
+
+	stream := sr.stream
+	upConn := wr.conn
+	defer stream.Close()
 	defer upConn.Close()
 	upConn.SetReadLimit(int64(maxWSMessageBytes))
 
@@ -119,7 +169,7 @@ func bridgeWebTransportToWS(sess *webtransport.Session, backendWSURL string, r *
 	go func() {
 		bw := bufio.NewWriterSize(stream, 64*1024)
 		var compBuf bytes.Buffer
-		fw, _ := flate.NewWriter(&compBuf, 5)
+		fw, _ := flate.NewWriter(&compBuf, 3)
 		var hdr [5]byte
 		for {
 			msgType, data, err := upConn.ReadMessage()
@@ -167,6 +217,7 @@ func bridgeWebTransportToWS(sess *webtransport.Session, backendWSURL string, r *
 	// WebTransport stream -> Upstream WS
 	go func() {
 		var hdr [5]byte
+		scratch := make([]byte, 64*1024)
 		for {
 			if _, err := io.ReadFull(stream, hdr[:]); err != nil {
 				errCh <- err
@@ -178,7 +229,15 @@ func bridgeWebTransportToWS(sess *webtransport.Session, backendWSURL string, r *
 				errCh <- fmt.Errorf("frame too large: %d", length)
 				return
 			}
-			payload := make([]byte, length)
+			var payload []byte
+			if length <= 256*1024 {
+				if int(length) > cap(scratch) {
+					scratch = make([]byte, int(length))
+				}
+				payload = scratch[:int(length)]
+			} else {
+				payload = make([]byte, length)
+			}
 			if length > 0 {
 				if _, err := io.ReadFull(stream, payload); err != nil {
 					errCh <- err
@@ -216,6 +275,7 @@ func main() {
 	certPath := flag.String("cert", "", "TLS certificate PEM path")
 	keyPath := flag.String("key", "", "TLS private key PEM path")
 	maxPacketSize := flag.Int("max-packet-size", 1200, "Initial QUIC packet size")
+	noAuth := flag.Bool("no-auth", false, "Skip backend auth check on /wt-websocket")
 	flag.Parse()
 
 	if *listenAddr == "" || *backendAddr == "" || *certPath == "" || *keyPath == "" {
@@ -234,13 +294,17 @@ func main() {
 	}
 	backendWSURL := "wss://" + *backendAddr + "/connect-websocket"
 
+	backendTLS := &tls.Config{
+		InsecureSkipVerify: true,
+		ClientSessionCache: tls.NewLRUClientSessionCache(64),
+	}
 	backendTransport := &http.Transport{
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+		TLSClientConfig:     backendTLS,
 		DisableCompression:  true,
 		MaxIdleConns:        128,
 		MaxIdleConnsPerHost: 64,
 		IdleConnTimeout:     90 * time.Second,
-		ForceAttemptHTTP2:   false,
+		ForceAttemptHTTP2:   true,
 	}
 	authClient := &http.Client{
 		Transport: backendTransport,
@@ -262,6 +326,7 @@ func main() {
 
 	proxy := &httputil.ReverseProxy{
 		Transport:     backendTransport,
+		BufferPool:    newSlicePool(64 * 1024),
 		FlushInterval: -1,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(backendURL)
@@ -310,15 +375,17 @@ func main() {
 			http.Error(w, "WebTransport requires HTTP/3", http.StatusUpgradeRequired)
 			return
 		}
-		if status := verifyBackendAuth(r.Context(), authClient, backendOrigin, r); status != http.StatusOK {
-			http.Error(w, "Authentication required", status)
-			return
+		if !*noAuth {
+			if status := verifyBackendAuth(r.Context(), authClient, backendOrigin, r); status != http.StatusOK {
+				http.Error(w, "Authentication required", status)
+				return
+			}
 		}
 		sess, err := wtServer.Upgrade(w, r)
 		if err != nil {
 			return
 		}
-		bridgeWebTransportToWS(sess, backendWSURL, r)
+		bridgeWebTransportToWS(sess, backendWSURL, backendTLS, r)
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

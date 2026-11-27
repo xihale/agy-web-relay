@@ -187,6 +187,7 @@
       }
       if (bootSumState && bootSumState.sock === sock) {
         if (bootSumState.timer) clearTimeout(bootSumState.timer);
+        if (bootSumState.deferredTimer) clearTimeout(bootSumState.deferredTimer);
         if (bootSumState.adoptedId) reverseAliases.delete(bootSumState.adoptedId);
         streamAliases.delete('__agy_pre_sum');
         bootSumState = null;
@@ -281,6 +282,89 @@
       }
     };
 
+    const splitPrioritySummaries = (updatesMap, priorityCascadeId, maxFirst = 50) => {
+      const keys = Object.keys(updatesMap);
+      if (keys.length <= 80) {
+        return { immediate: updatesMap, deferred: null };
+      }
+      const immediate = Object.create(null);
+      const deferred = Object.create(null);
+      const picked = new Set();
+
+      if (priorityCascadeId && Object.prototype.hasOwnProperty.call(updatesMap, priorityCascadeId)) {
+        immediate[priorityCascadeId] = updatesMap[priorityCascadeId];
+        picked.add(priorityCascadeId);
+      }
+
+      const recentTopLevel = [];
+      for (const key of keys) {
+        if (picked.has(key)) continue;
+        const sum = updatesMap[key];
+        if (!sum) continue;
+        const isActiveOrWaiting = sum.notFullyIdle || (Array.isArray(sum.waitingSteps) && sum.waitingSteps.length > 0);
+        const parentId = sum.trajectoryMetadata?.parentConversationId;
+        if (isActiveOrWaiting || (priorityCascadeId && parentId === priorityCascadeId)) {
+          immediate[key] = sum;
+          picked.add(key);
+        } else if (!parentId) {
+          recentTopLevel.push([key, sum, sum.lastModifiedTime || sum.createdTime || '']);
+        }
+      }
+
+      recentTopLevel.sort((a, b) => (b[2] < a[2] ? -1 : b[2] > a[2] ? 1 : 0));
+      let added = 0;
+      for (const [key, sum] of recentTopLevel) {
+        if (added >= maxFirst) break;
+        immediate[key] = sum;
+        picked.add(key);
+        added++;
+      }
+
+      let deferredCount = 0;
+      for (const key of keys) {
+        if (picked.has(key)) continue;
+        deferred[key] = updatesMap[key];
+        deferredCount++;
+      }
+
+      return deferredCount > 0 ? { immediate, deferred } : { immediate: updatesMap, deferred: null };
+    };
+
+    const scheduleDeferredSummaryChunks = (state, sock, streamId) => {
+      if (!state || !state.deferredUpdates || sock.readyState !== 1) return;
+      const deferredKeys = Object.keys(state.deferredUpdates);
+      if (deferredKeys.length === 0) {
+        state.deferredUpdates = null;
+        return;
+      }
+      let offset = 0;
+      const pumpChunk = () => {
+        state.deferredTimer = 0;
+        if (bootSumState !== state || state.adoptedId !== streamId || sock.readyState !== 1 || !state.deferredUpdates) {
+          return;
+        }
+        const chunk = Object.create(null);
+        let taken = 0;
+        while (offset < deferredKeys.length && taken < 250) {
+          const k = deferredKeys[offset++];
+          if (Object.prototype.hasOwnProperty.call(state.deferredUpdates, k)) {
+            chunk[k] = state.deferredUpdates[k];
+            delete state.deferredUpdates[k];
+            taken++;
+          }
+        }
+        if (taken > 0) {
+          sock._dispatchDirectMessage(JSON.stringify({ streamId, type: 'data', payload: { updates: chunk } }));
+        }
+        if (offset < deferredKeys.length && bootSumState === state && state.adoptedId === streamId && sock.readyState === 1) {
+          state.deferredTimer = setTimeout(pumpChunk, 16);
+        } else {
+          state.deferredUpdates = null;
+        }
+      };
+      state.deferredTimer = setTimeout(pumpChunk, 80);
+    };
+
     const attachControlHandlers = (sock) => {
       if (!sock || sock.__agyControlHandlers) return sock;
       sock.__agyControlHandlers = true;
@@ -310,17 +394,31 @@
         if (bootSumState && bootSumState.sock === sock && raw.includes('"__agy_pre_sum"')) {
           if (bootSumState.adoptedId) {
             const targetId = bootSumState.adoptedId;
-            if (bootSumState.persistFrames < 32) {
-              bootSumState.persistFrames++;
+            if (bootSumState.deferredUpdates || bootSumState.persistFrames < 32) {
               try {
                 const parsed = JSON.parse(raw);
                 if (parsed?.streamId === '__agy_pre_sum' && parsed.type === 'data' && parsed.payload) {
-                  mergeSummaryPayload(bootSumState.persistUpdates, null, parsed.payload);
-                  agyIdbCache.putDebounced(
-                    'boot:summaries',
-                    agyIdbCache.compactSummaries(bootSumState.persistUpdates),
-                    1500,
-                  );
+                  if (bootSumState.deferredUpdates) {
+                    if (parsed.payload.updates) {
+                      for (const k of Object.keys(parsed.payload.updates)) {
+                        delete bootSumState.deferredUpdates[k];
+                      }
+                    }
+                    if (Array.isArray(parsed.payload.deletes)) {
+                      for (const id of parsed.payload.deletes) {
+                        delete bootSumState.deferredUpdates[id];
+                      }
+                    }
+                  }
+                  if (bootSumState.persistFrames < 32) {
+                    bootSumState.persistFrames++;
+                    mergeSummaryPayload(bootSumState.persistUpdates, null, parsed.payload);
+                    agyIdbCache.putDebounced(
+                      'boot:summaries',
+                      agyIdbCache.compactSummaries(bootSumState.persistUpdates),
+                      1500,
+                    );
+                  }
                 }
               } catch {}
             }
@@ -567,6 +665,9 @@
                     bootSumState.mergedDeletes = new Set();
                     bootSumState.extraPayloads = [];
                     if (hadData) {
+                      const { immediate, deferred } = splitPrioritySummaries(bufferedUpdates, bootCascadeId, 50);
+                      const sumRef = bootSumState;
+                      sumRef.deferredUpdates = deferred;
                       agyIdbCache.putDebounced(
                         'boot:summaries',
                         agyIdbCache.compactSummaries(bufferedUpdates),
@@ -574,11 +675,14 @@
                       );
                       queueMicrotask(() => {
                         if (sock.readyState !== 1) return;
-                        const merged = { updates: bufferedUpdates };
+                        const merged = { updates: immediate };
                         if (bufferedDeletes.length > 0) merged.deletes = bufferedDeletes;
                         sock._dispatchDirectMessage(JSON.stringify({ streamId, type: 'data', payload: merged }));
                         for (const extra of bufferedExtras) {
                           sock._dispatchDirectMessage(JSON.stringify({ streamId, type: 'data', payload: extra }));
+                        }
+                        if (deferred) {
+                          scheduleDeferredSummaryChunks(sumRef, sock, streamId);
                         }
                       });
                     } else {
@@ -654,6 +758,7 @@
                     streamAliases.delete(preId);
                     if (bootSumState && bootSumState.adoptedId === parsed.streamId) {
                       if (bootSumState.timer) clearTimeout(bootSumState.timer);
+                      if (bootSumState.deferredTimer) clearTimeout(bootSumState.deferredTimer);
                       bootSumState = null;
                     }
                     if (prefetchStreams.has(preId)) {

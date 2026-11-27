@@ -5,9 +5,46 @@ export const MAX_WS_MESSAGE_BYTES = 64 * 1024 * 1024;
 const MAX_HANDSHAKE_BYTES = 16 * 1024;
 const MAX_PENDING_MESSAGES = 64;
 const MAX_PENDING_BYTES = 8 * 1024 * 1024;
-const DEFLATE_MIN_BYTES = 128;
-const DEFLATE_HIGH_LEVEL_THRESHOLD = 16 * 1024;
+const DEFLATE_MIN_BYTES = 256;
+const DEFLATE_HIGH_LEVEL_THRESHOLD = 64 * 1024;
+const ZLIB_POOL_MAX = 4;
 const SYNC_TAIL = Buffer.from([0x00, 0x00, 0xff, 0xff]);
+const deflatePools = new Map();
+const inflatePool = [];
+
+function acquireDeflate(level) {
+  const pool = deflatePools.get(level);
+  if (pool && pool.length > 0) return pool.pop();
+  return zlib.createDeflateRaw({ level, windowBits: 15, memLevel: 8 });
+}
+
+function releaseDeflate(level, handle) {
+  let pool = deflatePools.get(level);
+  if (!pool) {
+    pool = [];
+    deflatePools.set(level, pool);
+  }
+  if (pool.length < ZLIB_POOL_MAX && typeof handle.reset === 'function') {
+    handle.reset();
+    pool.push(handle);
+  } else {
+    handle.destroy();
+  }
+}
+
+function acquireInflate() {
+  if (inflatePool.length > 0) return inflatePool.pop();
+  return zlib.createInflateRaw({ windowBits: 15 });
+}
+
+function releaseInflate(handle) {
+  if (inflatePool.length < ZLIB_POOL_MAX && typeof handle.reset === 'function') {
+    handle.reset();
+    inflatePool.push(handle);
+  } else {
+    handle.destroy();
+  }
+}
 
 export function clientOffersPerMessageDeflate(extHeader) {
   if (!extHeader) return false;
@@ -220,25 +257,32 @@ export class WsFrameParser {
   }
 }
 
-export function deflateWsPayload(buf, level = 4) {
+export function deflateWsPayload(buf, level = 3) {
   return new Promise((resolve, reject) => {
     const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-    const comp = zlib.createDeflateRaw({ level, windowBits: 15 });
+    const comp = acquireDeflate(level);
     const chunks = [];
     let settled = false;
+    const onData = (c) => chunks.push(c);
+    const cleanup = () => {
+      comp.removeListener('data', onData);
+      comp.removeListener('error', fail);
+    };
     const fail = (err) => {
       if (settled) return;
       settled = true;
+      cleanup();
       comp.destroy();
       reject(err);
     };
     comp.on('error', fail);
-    comp.on('data', (c) => chunks.push(c));
+    comp.on('data', onData);
     comp.write(input);
     comp.flush(zlib.constants.Z_SYNC_FLUSH, () => {
       if (settled) return;
       settled = true;
-      comp.destroy();
+      cleanup();
+      releaseDeflate(level, comp);
       let out = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
       if (
         out.length >= 4 &&
@@ -257,18 +301,11 @@ export function deflateWsPayload(buf, level = 4) {
 export function inflateWsPayload(buf, maxBytes = MAX_WS_MESSAGE_BYTES) {
   return new Promise((resolve, reject) => {
     const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-    const inf = zlib.createInflateRaw({ windowBits: 15 });
+    const inf = acquireInflate();
     const chunks = [];
     let totalBytes = 0;
     let settled = false;
-    const fail = (err) => {
-      if (settled) return;
-      settled = true;
-      inf.destroy();
-      reject(err);
-    };
-    inf.on('error', fail);
-    inf.on('data', (c) => {
+    const onData = (c) => {
       if (settled) return;
       totalBytes += c.length;
       if (totalBytes > maxBytes) {
@@ -276,13 +313,27 @@ export function inflateWsPayload(buf, maxBytes = MAX_WS_MESSAGE_BYTES) {
         return;
       }
       chunks.push(c);
-    });
+    };
+    const cleanup = () => {
+      inf.removeListener('data', onData);
+      inf.removeListener('error', fail);
+    };
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      inf.destroy();
+      reject(err);
+    };
+    inf.on('error', fail);
+    inf.on('data', onData);
     inf.write(input);
     inf.write(SYNC_TAIL);
     inf.flush(zlib.constants.Z_SYNC_FLUSH, () => {
       if (settled) return;
       settled = true;
-      inf.destroy();
+      cleanup();
+      releaseInflate(inf);
       resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, totalBytes));
     });
   });
@@ -419,7 +470,7 @@ export function attachWebSocketBridge({ req, clientSocket, upstreamSocket, head,
             payload: msg.payload,
           });
         }
-        const level = msg.payload.length >= DEFLATE_HIGH_LEVEL_THRESHOLD ? 6 : 4;
+        const level = msg.payload.length >= DEFLATE_HIGH_LEVEL_THRESHOLD ? 4 : 3;
         const compressed = await deflateWsPayload(msg.payload, level);
         if (compressed.length < msg.payload.length) {
           return encodeWsFrame({

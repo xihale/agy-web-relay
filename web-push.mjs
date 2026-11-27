@@ -561,12 +561,22 @@ export function createWebPushManager({
     const idx = state.subscriptions.findIndex((s) => s.endpoint === valid.endpoint);
     if (idx >= 0) {
       const prev = state.subscriptions[idx];
+      const nextLabel = deviceLabel?.trim() ? label : prev.deviceLabel || label;
+      if (
+        prev.keys?.p256dh === valid.keys.p256dh &&
+        prev.keys?.auth === valid.keys.auth &&
+        (prev.deviceLabel || label) === nextLabel &&
+        now - (prev.updatedAt || 0) < 6 * 60 * 60 * 1000
+      ) {
+        ensureMonitorStarted();
+        return { id: prev.id, deviceLabel: nextLabel, count: state.subscriptions.length };
+      }
       state.subscriptions[idx] = {
         ...prev,
         id,
         endpoint: valid.endpoint,
         keys: valid.keys,
-        deviceLabel: deviceLabel?.trim() ? label : prev.deviceLabel || label,
+        deviceLabel: nextLabel,
         userAgent: String(userAgent || prev.userAgent || '').slice(0, 240),
         updatedAt: now,
       };

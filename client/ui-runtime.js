@@ -314,6 +314,16 @@
       );
     }
 
+    const PUSH_SYNC_KEY = 'agy_relay_push_sync_v1';
+    function pushSubSignature(sub) {
+      try {
+        const json = sub?.toJSON ? sub.toJSON() : sub;
+        return `${json?.endpoint || ''}|${json?.keys?.p256dh || ''}|${json?.keys?.auth || ''}`;
+      } catch {
+        return '';
+      }
+    }
+
     async function postPushSubscribe(subscription) {
       const r = await fetchWithTimeout(
         '/relay-push/subscribe',
@@ -327,7 +337,14 @@
         5000,
       );
       if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.json();
+      const data = await r.json();
+      const sig = pushSubSignature(subscription);
+      if (sig) {
+        try {
+          localStorage.setItem(PUSH_SYNC_KEY, JSON.stringify({ sig, at: Date.now() }));
+        } catch {}
+      }
+      return data;
     }
 
     function showPushBanner() {
@@ -449,7 +466,25 @@
             if (!reg?.pushManager) return;
             const existing = await reg.pushManager.getSubscription();
             if (existing) {
-              await postPushSubscribe(existing).catch(() => {});
+              let syncedFresh = false;
+              try {
+                const rawSync = localStorage.getItem(PUSH_SYNC_KEY);
+                if (rawSync) {
+                  const parsed = JSON.parse(rawSync);
+                  const sig = pushSubSignature(existing);
+                  if (sig && parsed?.sig === sig && Date.now() - Number(parsed.at || 0) < 12 * 60 * 60 * 1000) {
+                    syncedFresh = true;
+                  }
+                }
+              } catch {}
+              if (!syncedFresh) {
+                const syncFn = () => { void postPushSubscribe(existing).catch(() => {}); };
+                if (typeof requestIdleCallback === 'function') {
+                  requestIdleCallback(syncFn, { timeout: 3000 });
+                } else {
+                  setTimeout(syncFn, 2500);
+                }
+              }
               return;
             }
             let dismissed = false;

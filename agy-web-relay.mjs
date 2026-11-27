@@ -714,20 +714,18 @@ async function main() {
       }
 
       if (useH3Edge) {
-        h3Proc = spawn(
-          opts.h3Bin,
-          [
-            '--listen',
-            `${bindIp}:${publicPort}`,
-            '--backend',
-            `127.0.0.1:${internalPort}`,
-            '--cert',
-            opts.cert,
-            '--key',
-            opts.key,
-          ],
-          { stdio: 'inherit' },
-        );
+        const h3Args = [
+          '--listen',
+          `${bindIp}:${publicPort}`,
+          '--backend',
+          `127.0.0.1:${internalPort}`,
+          '--cert',
+          opts.cert,
+          '--key',
+          opts.key,
+        ];
+        if (!auth.enabled) h3Args.push('--no-auth');
+        h3Proc = spawn(opts.h3Bin, h3Args, { stdio: 'inherit' });
         h3Proc.on('exit', (code, sig) => {
           if (!shuttingDown) {
             console.error(`agy-h3-edge exited unexpectedly (code=${code}, signal=${sig})`);
