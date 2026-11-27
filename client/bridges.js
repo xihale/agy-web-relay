@@ -165,11 +165,52 @@
   }
 
   if (!window.nativeNotifications) {
+    const hasRecentPushSync = () => {
+      try {
+        const raw = localStorage.getItem('agy_relay_push_sync_v1');
+        if (!raw) return false;
+        const parsed = JSON.parse(raw);
+        return Boolean(parsed?.sig && Date.now() - Number(parsed.at || 0) < 24 * 60 * 60 * 1000);
+      } catch {
+        return false;
+      }
+    };
+
     window.nativeNotifications = {
       send: async (opts) => {
         if (!opts?.title || typeof Notification === 'undefined' || Notification.permission !== 'granted') {
           return;
         }
+        try {
+          if (document?.visibilityState === 'visible' && document?.hasFocus?.()) {
+            return;
+          }
+        } catch {}
+
+        let swReg = null;
+        if (typeof navigator !== 'undefined' && navigator.serviceWorker?.ready) {
+          try {
+            swReg = await Promise.race([
+              navigator.serviceWorker.ready,
+              new Promise((r) => setTimeout(() => r(null), 250)),
+            ]);
+          } catch {
+            swReg = null;
+          }
+          if (swReg?.pushManager?.getSubscription) {
+            try {
+              const activeSub = await swReg.pushManager.getSubscription();
+              // Web Push already delivers authoritative PWA notifications and prewarms IDB;
+              // skip duplicate local notifications that can surface under Chrome instead of the PWA.
+              if (activeSub) return;
+            } catch {}
+          } else if (hasRecentPushSync()) {
+            return;
+          }
+        } else if (hasRecentPushSync()) {
+          return;
+        }
+
         const body = opts.body || '';
         const cascadeId = opts.payload?.cascadeId || '';
         const tag = cascadeId ? 'agy-finished-' + cascadeId : undefined;
@@ -183,21 +224,17 @@
             url: cascadeId ? '/c/' + encodeURIComponent(cascadeId) : '/',
           },
         };
-        try {
-          if (typeof navigator !== 'undefined' && navigator.serviceWorker?.ready) {
-            const reg = await Promise.race([
-              navigator.serviceWorker.ready,
-              new Promise((r) => setTimeout(() => r(null), 250)),
-            ]);
-            if (reg && typeof reg.showNotification === 'function') {
-              await reg.showNotification(opts.title, notifOpts);
-              return;
-            }
-          }
-        } catch {}
-        try {
-          new Notification(opts.title, notifOpts);
-        } catch {}
+        if (swReg && typeof swReg.showNotification === 'function') {
+          try {
+            await swReg.showNotification(opts.title, notifOpts);
+            return;
+          } catch {}
+        }
+        if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
+          try {
+            new Notification(opts.title, notifOpts);
+          } catch {}
+        }
       },
       openSystemPreferences: async () => {
         try {

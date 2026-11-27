@@ -1,4 +1,4 @@
-const CACHE_NAME = 'agy-relay-shell-v13';
+const CACHE_NAME = 'agy-relay-shell-v14';
 const ASSET_CACHE_NAME = 'agy-relay-assets-v1';
 const APP_SHELL_KEY = '/__agy_app_shell';
 const CONVO_IDB_NAME = 'agy-relay-cache-v1';
@@ -10,6 +10,9 @@ const CACHE_PATHS = new Set([
   '/jetbox.css',
   '/compiled_tailwind.css',
   '/antigravityCascadeDone.mp3',
+  '/antigravityActionRequired.mp3',
+  '/dark.png',
+  '/light.png',
   '/relay-icon-192.png',
   '/relay-icon-512.png',
   '/relay-mobile.css',
@@ -148,15 +151,18 @@ function writeIdbSnapshot(key, data) {
   });
 }
 
-async function prewarmNotificationAssets(cascadeId) {
+async function prewarmNotificationAssets(cascadeId, { timeoutMs = 2500, includeShell = true } = {}) {
   const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
-  const timer = ac ? setTimeout(() => ac.abort(), 4000) : 0;
-  const tasks = [
-    caches
-      .open(CACHE_NAME)
-      .then((cache) => cache.match(APP_SHELL_KEY).then((hit) => revalidateAppShell(cache, hit)))
-      .catch(() => {}),
-  ];
+  const timer = ac ? setTimeout(() => ac.abort(), timeoutMs) : 0;
+  const tasks = [];
+  if (includeShell) {
+    tasks.push(
+      caches
+        .open(CACHE_NAME)
+        .then((cache) => cache.match(APP_SHELL_KEY).then((hit) => revalidateAppShell(cache, hit, ac?.signal || null)))
+        .catch(() => {}),
+    );
+  }
   if (typeof cascadeId === 'string' && CONVO_UUID_RE.test(cascadeId)) {
     tasks.push(
       fetch('/relay-cache/convo/' + encodeURIComponent(cascadeId), {
@@ -239,7 +245,21 @@ self.addEventListener('notificationclick', (event) => {
         return false;
       }
     };
-    const client = sameOriginClients.find((c) => !isNonSpaPath(c)) || sameOriginClients[0] || null;
+    const spaClients = sameOriginClients.filter((c) => !isNonSpaPath(c));
+    const targetPath = payload.cascadeId ? '/c/' + encodeURIComponent(payload.cascadeId) : '';
+    const client =
+      spaClients.find((c) => c.focused || c.visibilityState === 'visible') ||
+      (targetPath &&
+        spaClients.find((c) => {
+          try {
+            return new URL(c.url).pathname === targetPath;
+          } catch {
+            return false;
+          }
+        })) ||
+      spaClients[0] ||
+      sameOriginClients[0] ||
+      null;
     if (client) {
       if (!isNonSpaPath(client) && payload.cascadeId) {
         try {
@@ -261,11 +281,7 @@ self.addEventListener('notificationclick', (event) => {
       return;
     }
     if (typeof self.clients.openWindow === 'function') {
-      if (payload.cascadeId) {
-        await Promise.allSettled([self.clients.openWindow(targetUrl), prewarmNotificationAssets(payload.cascadeId)]);
-      } else {
-        await self.clients.openWindow(targetUrl);
-      }
+      await self.clients.openWindow(targetUrl);
     }
   })());
 });
@@ -346,8 +362,12 @@ self.addEventListener('message', (event) => {
   }
 });
 
-async function revalidateAppShell(cache, prevResp) {
-  const resp = await fetch('/', { credentials: 'same-origin', cache: 'no-store' });
+async function revalidateAppShell(cache, prevResp, signal = null) {
+  const resp = await fetch('/', {
+    credentials: 'same-origin',
+    cache: 'no-store',
+    ...(signal ? { signal } : {}),
+  });
   const ct = (resp?.headers?.get('content-type') || '').toLowerCase();
   const nextHash = resp?.headers?.get('x-agy-shell-hash') || '';
   if (resp && resp.status === 200 && ct.includes('text/html') && nextHash) {

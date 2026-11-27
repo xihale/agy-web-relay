@@ -1638,16 +1638,21 @@ test('MOBILE_JS /c/<uuid> prioritizes StreamAgentStateUpdates, adopts convo pref
   }
 });
 
-test('injectMobileHead places inline mobile script before blocking stylesheets', () => {
+test('injectMobileHead places inline mobile script early and mobile CSS after upstream inline styles', () => {
   const html =
     '<!doctype html><html><head><script>window.__APP_CONFIG__ = {"csrfToken":"abc"};</script>' +
-    '<link rel="stylesheet" href="/jetbox.css" /><script src="/main.js"></script></head><body></body></html>';
-  const patched = injectMobileHead(html, { '/jetbox.css': 'v1', '/main.js': 'v2' }, { css: 'body{}', js: 'console.log(1);' });
+    '<link rel="stylesheet" href="/jetbox.css" />' +
+    '<style>html, body, #root { height: 100%; background-color: transparent; }</style>' +
+    '<script src="/main.js"></script></head><body></body></html>';
+  const patched = injectMobileHead(html, { '/jetbox.css': 'v1', '/main.js': 'v2' }, { css: '#root{height:var(--agy-vvh,100dvh)}', js: 'console.log(1);' });
   const cfgIdx = patched.indexOf('window.__APP_CONFIG__');
-  const mobileIdx = patched.indexOf('<script data-agy-relay="mobile-js">');
+  const mobileJsIdx = patched.indexOf('<script data-agy-relay="mobile-js">');
   const cssLinkIdx = patched.indexOf('<link rel="stylesheet" href="/jetbox.css?v=v1"');
-  assert.ok(cfgIdx > 0 && mobileIdx > cfgIdx, 'mobile-js should appear after __APP_CONFIG__');
-  assert.ok(cssLinkIdx > mobileIdx, 'mobile-js should appear before blocking jetbox.css stylesheet');
+  const upstreamStyleIdx = patched.indexOf('background-color: transparent');
+  const mobileCssIdx = patched.indexOf('<style data-agy-relay="mobile-css">');
+  assert.ok(cfgIdx > 0 && mobileJsIdx > cfgIdx, 'mobile-js should appear after __APP_CONFIG__');
+  assert.ok(cssLinkIdx > mobileJsIdx, 'mobile-js should appear before blocking jetbox.css stylesheet');
+  assert.ok(mobileCssIdx > upstreamStyleIdx, 'mobile-css should appear after upstream inline <style> so #root/--agy-vvh overrides win');
 });
 
 test('ws-deflate-bridge pooled deflateWsPayload and inflateWsPayload roundtrip concurrently across sizes', async () => {
@@ -2143,4 +2148,253 @@ test('MOBILE_JS AGY_OPEN_CASCADE pushes fresh IDB snapshot into same-convo open 
     for (const id of intervals) clearInterval(id);
   }
 });
+
+test('SW_JS notificationclick openWindow finishes without waiting for prewarm and push passes AbortSignal to shell revalidation', async () => {
+  const listeners = new Map();
+  const opened = [];
+  const fetchCalls = [];
+  const cid = '22222222-2222-4222-8222-222222222222';
+  const cacheObj = {
+    match: async () => null,
+    put: async () => {},
+  };
+  const sandbox = {
+    URL,
+    Headers,
+    Response,
+    AbortController,
+    setTimeout,
+    clearTimeout,
+    console,
+    caches: { open: async () => cacheObj, keys: async () => [], delete: async () => true },
+    fetch: async (url, init) => {
+      fetchCalls.push({ url: String(url), hasSignal: Boolean(init?.signal) });
+      if (String(url) === '/') {
+        return new Response('<html><head><script>window.__APP_CONFIG__={"csrfToken":"t1"};</script></head></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html', 'x-agy-shell-hash': 'h1' },
+        });
+      }
+      return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+    },
+    self: {
+      location: { origin: 'https://relay.example:8421' },
+      registration: { showNotification: async () => {} },
+      clients: {
+        claim: async () => {},
+        matchAll: async () => [],
+        openWindow: async (u) => { opened.push(u); },
+      },
+      skipWaiting: async () => {},
+      addEventListener: (t, fn) => listeners.set(t, fn),
+    },
+  };
+  vm.runInNewContext(SW_JS, sandbox);
+
+  let pushWait = Promise.resolve();
+  listeners.get('push')({
+    data: { json: () => ({ title: 'A', body: 'B', cascadeId: cid, url: `/c/${cid}`, force: true }) },
+    waitUntil: (p) => { pushWait = p; },
+  });
+  await pushWait;
+  const rootFetch = fetchCalls.find((c) => c.url === '/');
+  assert.ok(rootFetch && rootFetch.hasSignal, 'push shell revalidation must pass AbortSignal so SW never hangs');
+
+  fetchCalls.length = 0;
+  let clickWait = Promise.resolve();
+  listeners.get('notificationclick')({
+    notification: { close: () => {}, data: { cascadeId: cid, url: `/c/${cid}` } },
+    waitUntil: (p) => { clickWait = p; },
+  });
+  await clickWait;
+  assert.deepEqual(opened, [`https://relay.example:8421/c/${cid}`]);
+  assert.equal(fetchCalls.length, 0, 'notificationclick openWindow must not block on extra prewarm fetches');
+});
+
+test('MOBILE_JS waits for slow connecting standby socket and hot-swaps on open instead of closing active socket', async () => {
+  const timers = new Set();
+  const intervals = new Set();
+  const trackTimeout = (fn, ms = 0, ...args) => {
+    const id = setTimeout(() => {
+      timers.delete(id);
+      fn(...args);
+    }, ms);
+    timers.add(id);
+    return id;
+  };
+  const trackClearTimeout = (id) => {
+    timers.delete(id);
+    clearTimeout(id);
+  };
+  const trackInterval = (fn, ms, ...args) => {
+    const id = setInterval(fn, ms, ...args);
+    intervals.add(id);
+    return id;
+  };
+  const trackClearInterval = (id) => {
+    intervals.delete(id);
+    clearInterval(id);
+  };
+
+  try {
+    const nativeSockets = [];
+    class MockWS {
+      static CONNECTING = 0;
+      static OPEN = 1;
+      static CLOSING = 2;
+      static CLOSED = 3;
+      constructor(url) {
+        this.url = url;
+        this.readyState = 0;
+        this.sent = [];
+        nativeSockets.push(this);
+        // First socket opens immediately; standby socket opens slowly at 320ms (> 200ms probe timeout)
+        const delay = nativeSockets.length === 1 ? 5 : 320;
+        trackTimeout(() => {
+          if (this.readyState !== 0) return;
+          this.readyState = 1;
+          this.onopen?.(new Event('open'));
+        }, delay);
+      }
+      send(d) { this.sent.push(d); }
+      close() {
+        if (this.readyState === 3) return;
+        this.readyState = 3;
+        this.onclose?.(new CloseEvent('close', { code: 1000, wasClean: true }));
+      }
+    }
+
+    const docListeners = new Map();
+    const realDateNow = Date.now;
+    let nowOffset = 0;
+    const MockDate = class extends Date {
+      static now() { return realDateNow() + nowOffset; }
+    };
+    const cid = '33333333-3333-4333-8333-333333333333';
+    const sandbox = {
+      Date: MockDate,
+      URL,
+      Event,
+      EventTarget,
+      MessageEvent,
+      CloseEvent,
+      Response,
+      TextEncoder,
+      TextDecoder,
+      WebSocket: MockWS,
+      setTimeout: trackTimeout,
+      clearTimeout: trackClearTimeout,
+      setInterval: trackInterval,
+      clearInterval: trackClearInterval,
+      queueMicrotask,
+      console,
+      fetch: async () => new Response('{"ok":true}', { status: 200 }),
+      __APP_CONFIG__: { csrfToken: 'csrf-slow' },
+      location: { protocol: 'https:', host: 'relay.example:8421', origin: 'https://relay.example:8421', href: `https://relay.example:8421/c/${cid}`, pathname: `/c/${cid}`, search: '', assign() {}, reload() {} },
+      document: {
+        readyState: 'complete',
+        visibilityState: 'visible',
+        documentElement: { style: { setProperty() {}, removeProperty() {} } },
+        head: { appendChild() {} },
+        body: null,
+        addEventListener: (t, fn) => docListeners.set(t, fn),
+        getElementById: () => null,
+        createElement: () => ({ setAttribute() {}, append() {} }),
+      },
+      navigator: { userAgent: 'Mozilla/5.0 Android Chrome' },
+      localStorage: { length: 0, getItem: () => null, setItem() {}, removeItem() {}, key: () => null },
+      addEventListener() {},
+      matchMedia: () => ({ matches: false }),
+    };
+    sandbox.window = sandbox;
+    sandbox.top = sandbox;
+
+    vm.runInNewContext(MOBILE_JS, sandbox);
+    await new Promise((r) => setTimeout(r, 25));
+
+    const sock = new sandbox.WebSocket('wss://relay.example:8421/connect-websocket');
+    await new Promise((r) => setTimeout(r, 10));
+    sock.send(JSON.stringify({
+      streamId: 'real-slow',
+      type: 'start',
+      procedure: '/exa.language_server_pb.LanguageServerService/StreamAgentStateUpdates',
+      stream: true,
+      payload: { conversationId: cid },
+    }));
+
+    let closedCount = 0;
+    sock.addEventListener('close', () => closedCount++);
+
+    const vis = docListeners.get('visibilitychange');
+    sandbox.document.visibilityState = 'hidden';
+    vis();
+    nowOffset += 10_000;
+    sandbox.document.visibilityState = 'visible';
+    vis();
+
+    // At 240ms (> 200ms probe timeout, < 320ms standby open): active socket must NOT be killed prematurely!
+    await new Promise((r) => setTimeout(r, 240));
+    assert.equal(closedCount, 0);
+    assert.equal(sock.readyState, 1);
+
+    // At 360ms (after standby opens at 320ms): standby hot-swaps seamlessly and replays real-slow!
+    await new Promise((r) => setTimeout(r, 130));
+    assert.equal(closedCount, 0);
+    assert.equal(sock.readyState, 1);
+    assert.equal(nativeSockets.length, 2);
+    assert.ok(nativeSockets[1].sent.some((s) => s.includes('"streamId":"real-slow"')));
+  } finally {
+    for (const id of timers) clearTimeout(id);
+    for (const id of intervals) clearInterval(id);
+  }
+});
+
+test('MOBILE_JS nativeNotifications.send skips duplicate local notification when Web Push is subscribed', async () => {
+  const shown = [];
+  let activeSub = { endpoint: 'https://fcm.googleapis.com/fcm/send/test' };
+  const swReg = {
+    pushManager: { getSubscription: async () => activeSub },
+    showNotification: async (title, opts) => { shown.push({ title, opts }); },
+  };
+  const sandbox = {
+    URL,
+    Event,
+    EventTarget,
+    MessageEvent,
+    CloseEvent,
+    Response,
+    TextEncoder,
+    TextDecoder,
+    setTimeout,
+    clearTimeout,
+    queueMicrotask,
+    console,
+    Notification: { permission: 'granted' },
+    location: { protocol: 'https:', host: 'relay.example:8421', origin: 'https://relay.example:8421', href: 'https://relay.example:8421/', pathname: '/', search: '', assign() {}, reload() {} },
+    document: {
+      readyState: 'loading',
+      visibilityState: 'hidden',
+      hasFocus: () => false,
+      addEventListener() {},
+    },
+    navigator: {
+      serviceWorker: { ready: Promise.resolve(swReg), register: async () => swReg, addEventListener() {} },
+    },
+    localStorage: { length: 0, getItem: () => null, setItem() {}, removeItem() {}, key: () => null },
+    addEventListener() {},
+    matchMedia: () => ({ matches: false }),
+  };
+  sandbox.window = sandbox;
+  sandbox.top = sandbox;
+
+  vm.runInNewContext(MOBILE_JS, sandbox);
+  await sandbox.nativeNotifications.send({ title: 'Antigravity', body: 'Done', payload: { cascadeId: 'cid-1' } });
+  assert.equal(shown.length, 0, 'must suppress duplicate local notification when Web Push is active');
+
+  activeSub = null;
+  await sandbox.nativeNotifications.send({ title: 'Antigravity', body: 'Done', payload: { cascadeId: 'cid-1' } });
+  assert.equal(shown.length, 1, 'should still deliver local notification when Web Push is not subscribed');
+});
+
+
 

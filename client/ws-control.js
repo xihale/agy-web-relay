@@ -79,6 +79,9 @@
     let lastInboundAt = 0;
     let lastSocketCloseAt = 0;
     let probeTimer = 0;
+    let probeGraceTimer = 0;
+    let probePendingSock = null;
+    let probeTimedOut = false;
     let probeSeq = 0;
 
     const BACKOFF_DELAYS = new Set([1000, 2000, 4000, 8000, 16000, 30000]);
@@ -430,10 +433,7 @@
       sock._onInboundMessage = (ev) => {
         if (activeControlSocket === sock) {
           lastInboundAt = Date.now();
-          if (probeTimer) {
-            nativeClearTimeout(probeTimer);
-            probeTimer = 0;
-          }
+          clearProbeTimers();
           clearStandby(true);
         }
         const raw = ev?.data;
@@ -584,14 +584,14 @@
         if (standbySocket === sock) {
           standbySocket = null;
           clearStandby(false);
+          if (probeTimedOut && probePendingSock && probePendingSock === activeControlSocket) {
+            closeStaleSocket(activeControlSocket);
+          }
         }
         if (activeControlSocket === sock) {
           activeControlSocket = null;
           lastSocketCloseAt = Date.now();
-          if (probeTimer) {
-            nativeClearTimeout(probeTimer);
-            probeTimer = 0;
-          }
+          clearProbeTimers();
         }
       }, { once: true });
       return sock;
@@ -600,10 +600,55 @@
     const createControlSocket = (preferWT = canUseWT && !window.__agyWtDisabled) =>
       attachControlHandlers(new WebTransportWebSocket(wtUrl, earlyWsUrl, undefined, preferWT));
 
+    const clearProbeTimers = () => {
+      if (probeTimer) {
+        nativeClearTimeout(probeTimer);
+        probeTimer = 0;
+      }
+      if (probeGraceTimer) {
+        nativeClearTimeout(probeGraceTimer);
+        probeGraceTimer = 0;
+      }
+      probePendingSock = null;
+      probeTimedOut = false;
+    };
+
+    const tryHotSwapActiveSocket = (sock) => {
+      if (!sock || activeControlSocket !== sock || sock.readyState !== 1) return false;
+      if (!standbySocket || standbySocket.readyState !== 1 || typeof sock._hotSwapTransport !== 'function') return false;
+      const donor = standbySocket;
+      standbySocket = null;
+      clearStandby(false);
+      clearProbeTimers();
+      clearPrefetchAndAliasTracking(sock);
+      if (sock._hotSwapTransport(donor)) {
+        lastInboundAt = Date.now();
+        for (const entry of openControlStreams.values()) {
+          if (entry.sock === sock) {
+            try { sock._rawSend(entry.rawStart); } catch {}
+          }
+        }
+        return true;
+      }
+      return false;
+    };
+
+    const closeStaleSocket = (sock) => {
+      clearProbeTimers();
+      if (!sock || activeControlSocket !== sock || sock.readyState !== 1) return;
+      try { sock.close(4000, 'stale-probe-timeout'); } catch {}
+      if (typeof sock._finishClose === 'function') {
+        try { sock._finishClose(1006, 'stale-probe-timeout', false); } catch {}
+      }
+    };
+
     const prewarmStandbySocket = (cascadeId = '') => {
       if (standbySocket || earlyWt) return;
       const fb = createControlSocket(canUseWT && !window.__agyWtDisabled);
       fb.addEventListener('open', () => {
+        if (probeTimedOut && probePendingSock && probePendingSock === activeControlSocket && tryHotSwapActiveSocket(activeControlSocket)) {
+          return;
+        }
         if (cascadeId) startConvoPrefetch(fb, cascadeId);
         if (!activeControlSocket || activeControlSocket.readyState !== 1) {
           wakeBackoffTimers();
@@ -626,36 +671,29 @@
         if (opts.prewarmStandby) prewarmStandbySocket(opts.cascadeId || '');
         return;
       }
-      if (probeTimer || Date.now() - lastInboundAt < minIdleMs) return;
+      if (probeTimer || probeGraceTimer || Date.now() - lastInboundAt < minIdleMs) return;
       if (opts.prewarmStandby) prewarmStandbySocket(opts.cascadeId || '');
       try {
         sock._rawSend(JSON.stringify({ streamId: '__agy_probe_' + (++probeSeq), type: 'ping' }));
       } catch {
         return;
       }
+      probePendingSock = sock;
+      probeTimedOut = false;
       const timeoutMs = typeof opts.timeoutMs === 'number' ? opts.timeoutMs : 450;
       probeTimer = nativeSetTimeout(() => {
         probeTimer = 0;
-        if (activeControlSocket !== sock || sock.readyState !== 1) return;
-        if (standbySocket && standbySocket.readyState === 1 && typeof sock._hotSwapTransport === 'function') {
-          const donor = standbySocket;
-          standbySocket = null;
-          clearStandby(false);
-          clearPrefetchAndAliasTracking(sock);
-          if (sock._hotSwapTransport(donor)) {
-            lastInboundAt = Date.now();
-            for (const entry of openControlStreams.values()) {
-              if (entry.sock === sock) {
-                try { sock._rawSend(entry.rawStart); } catch {}
-              }
-            }
-            return;
-          }
+        if (activeControlSocket !== sock || sock.readyState !== 1) {
+          clearProbeTimers();
+          return;
         }
-        try { sock.close(4000, 'stale-probe-timeout'); } catch {}
-        if (typeof sock._finishClose === 'function') {
-          try { sock._finishClose(1006, 'stale-probe-timeout', false); } catch {}
+        if (tryHotSwapActiveSocket(sock)) return;
+        if (standbySocket && standbySocket.readyState === 0) {
+          probeTimedOut = true;
+          probeGraceTimer = nativeSetTimeout(() => closeStaleSocket(sock), 1200);
+          return;
         }
+        closeStaleSocket(sock);
       }, timeoutMs);
     };
     triggerSocketProbe = probeActiveSocket;
@@ -693,10 +731,7 @@
       if (!sock) return sock;
       attachControlHandlers(sock);
       if (activeControlSocket === sock) return sock;
-      if (probeTimer) {
-        nativeClearTimeout(probeTimer);
-        probeTimer = 0;
-      }
+      clearProbeTimers();
       activeControlSocket = sock;
       lastInboundAt = Date.now();
       sock.addEventListener('open', () => {
