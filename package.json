@@ -1,0 +1,24 @@
+{
+  "name": "agy-web-relay",
+  "version": "1.0.0",
+  "description": "Zero-dependency HTTPS + HTTP/2 + HTTP/3 WebTransport reverse proxy and mobile PWA enhancer for local Antigravity language_server.",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://github.com/xihale/agy-web-relay#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xihale/agy-web-relay.git"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "bin": {
+    "agy-web-relay": "./agy-web-relay.mjs"
+  },
+  "scripts": {
+    "start": "node agy-web-relay.mjs",
+    "test": "node --test web-push.test.mjs relay-perf.test.mjs",
+    "check": "node --check agy-web-relay.mjs mobile-assets.mjs web-push.mjs ws-deflate-bridge.mjs lib/*.mjs client/*.mjs",
+    "build:h3": "cd h3-edge && go build -trimpath -ldflags='-s -w' -o agy-h3-edge ."
+  }
+}

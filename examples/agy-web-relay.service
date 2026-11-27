@@ -1,0 +1,16 @@
+[Unit]
+Description=Antigravity Local Web Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace WorkingDirectory and ExecStart paths with your clone location and node binary
+WorkingDirectory=%h/agy-web-relay
+ExecStart=/usr/bin/env node %h/agy-web-relay/agy-web-relay.mjs --wait-easytier --no-auth --port 8421 --http3
+Restart=always
+RestartSec=2
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=default.target

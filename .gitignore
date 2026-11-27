@@ -1,2 +1,7 @@
 .csearch/
 h3-edge/agy-h3-edge
+.DS_Store
+*.log
+*.pem
+*.key
+*.crt
