@@ -269,7 +269,7 @@
         hiddenAt = 0;
         retryCount = 0;
         checkRelayHealth();
-        triggerSocketProbe?.(1500, { timeoutMs: 450, prewarmStandby: hiddenMs >= 8000 });
+        triggerSocketProbe?.(1500, { timeoutMs: hiddenMs >= 8000 ? 250 : 450, prewarmStandby: hiddenMs >= 8000 });
       } else {
         hiddenAt = Date.now();
         clearRetryTimer();
@@ -428,7 +428,6 @@
             }
           } catch {}
         } else if (data && data.type === 'AGY_OPEN_CASCADE') {
-          triggerSocketProbe?.(1500, { timeoutMs: 450, prewarmStandby: true });
           let cascadeId = typeof data.cascadeId === 'string' ? data.cascadeId : '';
           if (!cascadeId && data.url) {
             try {
@@ -439,6 +438,7 @@
               }
             } catch {}
           }
+          prepareNotificationCascade?.(cascadeId);
           dispatchCascadeOpen(cascadeId, data.url);
         }
       });

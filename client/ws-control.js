@@ -21,6 +21,7 @@
   let triggerSocketProbe = null;
   let triggerConvoPrefetch = null;
   let prewarmStandbyControlSocket = null;
+  let prepareNotificationCascade = null;
   if (
     window === window.top &&
     typeof window.WebSocket === 'function' &&
@@ -105,13 +106,82 @@
       }
     };
 
+    let deferredSumTimer = 0;
+    let deferredSumSock = null;
+
+    const sendSummariesPrefetch = (sock) => {
+      if (!sock || sock.readyState !== 1 || bootSumState) return;
+      const csrf = window.__APP_CONFIG__?.csrfToken || '';
+      if (!csrf) return;
+      const preId = '__agy_pre_sum';
+      const timer = setTimeout(() => {
+        if (bootSumState && bootSumState.sock === sock && !bootSumState.adoptedId) {
+          bootSumState = null;
+          if (sock.readyState === 1) {
+            try { sock._rawSend(JSON.stringify({ streamId: preId, type: 'cancel' })); } catch {}
+          }
+        }
+      }, 15000);
+      bootSumState = {
+        preId,
+        sock,
+        adoptedId: null,
+        mergedUpdates: Object.create(null),
+        mergedDeletes: new Set(),
+        extraPayloads: [],
+        hasData: false,
+        ended: false,
+        timer,
+        persistUpdates: Object.create(null),
+        persistFrames: 0,
+      };
+      try {
+        sock._rawSend(JSON.stringify({
+          streamId: preId,
+          type: 'start',
+          procedure: '/exa.language_server_pb.LanguageServerService/JetboxSubscribeToSummaries',
+          stream: true,
+          headers: {
+            'x-codeium-csrf-token': [csrf],
+            'content-type': ['application/connect+json'],
+            'connect-protocol-version': ['1'],
+          },
+          payload: {},
+        }));
+      } catch {
+        clearTimeout(timer);
+        bootSumState = null;
+      }
+    };
+
+    const flushDeferredSummaries = () => {
+      if (deferredSumTimer) {
+        clearTimeout(deferredSumTimer);
+        deferredSumTimer = 0;
+      }
+      const targetSock = deferredSumSock;
+      deferredSumSock = null;
+      if (targetSock && targetSock.readyState === 1) {
+        sendSummariesPrefetch(targetSock);
+      }
+    };
+
     const clearSocketTracking = (sock) => {
+      if (deferredSumSock === sock) {
+        if (deferredSumTimer) {
+          clearTimeout(deferredSumTimer);
+          deferredSumTimer = 0;
+        }
+        deferredSumSock = null;
+      }
       for (const [sid, entry] of activeStateStreams.entries()) {
         if (entry.sock === sock) activeStateStreams.delete(sid);
       }
       for (const [pid, info] of prefetchStreams.entries()) {
         if (info.sock === sock) {
           if (info.timer) clearTimeout(info.timer);
+          if (info.adoptedId) reverseAliases.delete(info.adoptedId);
+          streamAliases.delete(pid);
           prefetchStreams.delete(pid);
         }
       }
@@ -123,7 +193,7 @@
       }
     };
 
-    const startBootPrefetches = (sock) => {
+    const startBootPrefetches = (sock, bootOpts = {}) => {
       if (!sock || sock.readyState !== 1) return;
       const csrf = window.__APP_CONFIG__?.csrfToken || '';
       if (!csrf) return;
@@ -143,44 +213,13 @@
         } catch {}
       }
       if (!bootSumState) {
-        const preId = '__agy_pre_sum';
-        const timer = setTimeout(() => {
-          if (bootSumState && bootSumState.sock === sock && !bootSumState.adoptedId) {
-            bootSumState = null;
-            if (sock.readyState === 1) {
-              try { sock._rawSend(JSON.stringify({ streamId: preId, type: 'cancel' })); } catch {}
-            }
-          }
-        }, 15000);
-        bootSumState = {
-          preId,
-          sock,
-          adoptedId: null,
-          mergedUpdates: Object.create(null),
-          mergedDeletes: new Set(),
-          extraPayloads: [],
-          hasData: false,
-          ended: false,
-          timer,
-          persistUpdates: Object.create(null),
-          persistFrames: 0,
-        };
-        try {
-          sock._rawSend(JSON.stringify({
-            streamId: preId,
-            type: 'start',
-            procedure: '/exa.language_server_pb.LanguageServerService/JetboxSubscribeToSummaries',
-            stream: true,
-            headers: {
-              'x-codeium-csrf-token': [csrf],
-              'content-type': ['application/connect+json'],
-              'connect-protocol-version': ['1'],
-            },
-            payload: {},
-          }));
-        } catch {
-          clearTimeout(timer);
-          bootSumState = null;
+        const deferMs = Number(bootOpts.deferSummariesMs || 0);
+        if (deferMs > 0) {
+          if (deferredSumTimer) clearTimeout(deferredSumTimer);
+          deferredSumSock = sock;
+          deferredSumTimer = setTimeout(flushDeferredSummaries, deferMs);
+        } else {
+          sendSummariesPrefetch(sock);
         }
       }
     };
@@ -195,11 +234,11 @@
       const existing = convoSnapshotCache.get(cascadeId);
       if (existing && Date.now() - existing.at < 3000) return;
       for (const [pid, info] of prefetchStreams.entries()) {
-        if (info.sock === sock) cancelPrefetchEntry(sock, pid);
+        if (info.sock === sock && !info.adoptedId) cancelPrefetchEntry(sock, pid);
       }
       const preId = '__agy_pre_' + (++preSeq);
       const timer = setTimeout(() => cancelPrefetchEntry(sock, preId), 4000);
-      prefetchStreams.set(preId, { cascadeId, sock, timer });
+      prefetchStreams.set(preId, { cascadeId, sock, timer, adoptedId: null, cached: false });
       try {
         sock._rawSend(JSON.stringify({
           streamId: preId,
@@ -329,8 +368,30 @@
             const parsed = JSON.parse(raw);
             const info = parsed?.streamId ? prefetchStreams.get(parsed.streamId) : null;
             if (info) {
+              if (info.adoptedId) {
+                if (parsed.type === 'data' && parsed.payload && !info.cached) {
+                  info.cached = true;
+                  cacheConvoSnapshot(info.cascadeId, parsed.payload);
+                  if (info.cascadeId === bootCascadeId) flushDeferredSummaries();
+                } else if (parsed.type === 'end') {
+                  prefetchStreams.delete(parsed.streamId);
+                  streamAliases.delete(parsed.streamId);
+                  reverseAliases.delete(info.adoptedId);
+                }
+                parsed.streamId = info.adoptedId;
+                sock._dispatchDirectMessage(JSON.stringify(parsed));
+                return false;
+              }
               if (parsed.type === 'data' && parsed.payload) {
+                info.cached = true;
                 cacheConvoSnapshot(info.cascadeId, parsed.payload);
+                if (info.cascadeId === bootCascadeId) flushDeferredSummaries();
+                for (const [sid, entry] of activeStateStreams.entries()) {
+                  if (entry.sock === sock && entry.cascadeId === info.cascadeId && !entry.captured) {
+                    entry.captured = true;
+                    sock._dispatchDirectMessage(JSON.stringify({ streamId: sid, type: 'data', payload: parsed.payload }));
+                  }
+                }
                 cancelPrefetchEntry(info.sock, parsed.streamId);
               } else if (parsed.type === 'end') {
                 if (info.timer) clearTimeout(info.timer);
@@ -373,9 +434,14 @@
     const createControlSocket = (preferWT = canUseWT && !window.__agyWtDisabled) =>
       attachControlHandlers(new WebTransportWebSocket(wtUrl, earlyWsUrl, undefined, preferWT));
 
-    const prewarmStandbySocket = () => {
+    const prewarmStandbySocket = (cascadeId = '') => {
       if (standbySocket || earlyWt) return;
       const fb = createControlSocket(canUseWT && !window.__agyWtDisabled);
+      if (cascadeId) {
+        fb.addEventListener('open', () => {
+          startConvoPrefetch(fb, cascadeId);
+        }, { once: true });
+      }
       standbySocket = fb;
       standbyTimer = setTimeout(() => {
         standbyTimer = 0;
@@ -389,9 +455,12 @@
 
     const probeActiveSocket = (minIdleMs, opts = {}) => {
       const sock = activeControlSocket;
-      if (!sock || sock.readyState !== 1 || probeTimer) return;
-      if (Date.now() - lastInboundAt < minIdleMs) return;
-      if (opts.prewarmStandby) prewarmStandbySocket();
+      if (!sock || sock.readyState !== 1) {
+        if (opts.prewarmStandby) prewarmStandbySocket(opts.cascadeId || '');
+        return;
+      }
+      if (probeTimer || Date.now() - lastInboundAt < minIdleMs) return;
+      if (opts.prewarmStandby) prewarmStandbySocket(opts.cascadeId || '');
       try {
         sock._rawSend(JSON.stringify({ streamId: '__agy_probe_' + (++probeSeq), type: 'ping' }));
       } catch {
@@ -418,6 +487,15 @@
       if (sock) startConvoPrefetch(sock, cascadeId);
     };
 
+    prepareNotificationCascade = (cascadeId) => {
+      if (cascadeId) {
+        convoSnapshotCache.delete(cascadeId);
+        agyIdbCache.getConvoAsync(cascadeId, { bypassMemory: true }).catch(() => null);
+        triggerConvoPrefetch(cascadeId);
+      }
+      probeActiveSocket(1500, { timeoutMs: 250, prewarmStandby: true, cascadeId });
+    };
+
     const trackControlSocket = (sock) => {
       if (!sock) return sock;
       attachControlHandlers(sock);
@@ -436,6 +514,9 @@
         sock.send = (data) => {
           if (typeof data === 'string') {
             if (data.includes('"type":"start"')) {
+              if (data.includes('/JetboxSubscribeToSummaries')) {
+                flushDeferredSummaries();
+              }
               if (data.includes('/GetUserStatus')) {
                 try {
                   const parsed = JSON.parse(data);
@@ -519,6 +600,24 @@
                   const streamId = parsed?.streamId;
                   const cascadeId = parsed?.payload?.conversationId;
                   if (streamId && cascadeId) {
+                    let adoptedPreId = null;
+                    const boundsStart = parsed?.payload?.initialStepsPageBounds?.startIndex;
+                    const stdBounds = !parsed?.payload?.initialStepsPageBounds || boundsStart === -50;
+                    if (stdBounds) {
+                      for (const [pid, info] of prefetchStreams.entries()) {
+                        if (info.sock === sock && info.cascadeId === cascadeId && !info.adoptedId) {
+                          info.adoptedId = streamId;
+                          if (info.timer) {
+                            clearTimeout(info.timer);
+                            info.timer = 0;
+                          }
+                          streamAliases.set(pid, streamId);
+                          reverseAliases.set(streamId, pid);
+                          adoptedPreId = pid;
+                          break;
+                        }
+                      }
+                    }
                     activeStateStreams.set(streamId, { cascadeId, captured: false, sock });
                     const ramCached = convoSnapshotCache.get(cascadeId);
                     const bootCached = ramCached && Date.now() - ramCached.at < CONVO_CACHE_TTL_MS
@@ -539,6 +638,7 @@
                         }
                       });
                     }
+                    if (adoptedPreId) return;
                   }
                 } catch {}
               }
@@ -555,6 +655,11 @@
                     if (bootSumState && bootSumState.adoptedId === parsed.streamId) {
                       if (bootSumState.timer) clearTimeout(bootSumState.timer);
                       bootSumState = null;
+                    }
+                    if (prefetchStreams.has(preId)) {
+                      const preInfo = prefetchStreams.get(preId);
+                      if (preInfo?.timer) clearTimeout(preInfo.timer);
+                      prefetchStreams.delete(preId);
                     }
                     return sock._rawSend(JSON.stringify({ ...parsed, streamId: preId }));
                   }
@@ -579,8 +684,12 @@
 
     earlyWt = createControlSocket(canUseWT && !window.__agyWtDisabled);
     earlyWt.addEventListener('open', () => {
-      startBootPrefetches(earlyWt);
-      if (bootCascadeId) startConvoPrefetch(earlyWt, bootCascadeId);
+      if (bootCascadeId) {
+        startConvoPrefetch(earlyWt, bootCascadeId);
+        startBootPrefetches(earlyWt, { deferSummariesMs: 250 });
+      } else {
+        startBootPrefetches(earlyWt);
+      }
     }, { once: true });
     earlyCleanupTimer = setTimeout(() => {
       earlyCleanupTimer = 0;

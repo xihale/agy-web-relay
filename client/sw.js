@@ -1,5 +1,8 @@
-const CACHE_NAME = 'agy-relay-static-v11';
+const CACHE_NAME = 'agy-relay-static-v12';
 const APP_SHELL_KEY = '/__agy_app_shell';
+const CONVO_IDB_NAME = 'agy-relay-cache-v1';
+const CONVO_IDB_STORE = 'snapshots';
+const CONVO_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CACHE_PATHS = new Set([
   '/main.js',
   '/prism_bundle.js',
@@ -52,6 +55,103 @@ self.addEventListener('activate', (event) => {
   );
 });
 
+function writeIdbSnapshot(key, data) {
+  if (!key || data === undefined || typeof indexedDB === 'undefined' || !indexedDB?.open) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    try {
+      const openReq = indexedDB.open(CONVO_IDB_NAME, 1);
+      openReq.onupgradeneeded = () => {
+        try {
+          const db = openReq.result;
+          if (!db.objectStoreNames.contains(CONVO_IDB_STORE)) {
+            db.createObjectStore(CONVO_IDB_STORE, { keyPath: 'key' });
+          }
+        } catch {}
+      };
+      openReq.onerror = () => resolve();
+      openReq.onblocked = () => resolve();
+      openReq.onsuccess = () => {
+        const db = openReq.result;
+        try {
+          const tx = db.transaction(CONVO_IDB_STORE, 'readwrite');
+          const store = tx.objectStore(CONVO_IDB_STORE);
+          store.put({ key, data, updatedAt: Date.now() });
+          if (key.startsWith('convo:')) {
+            const keysReq = store.getAllKeys ? store.getAllKeys() : null;
+            if (keysReq) {
+              keysReq.onsuccess = () => {
+                const convoKeys = (keysReq.result || []).filter((k) => typeof k === 'string' && k.startsWith('convo:'));
+                if (convoKeys.length <= 8) return;
+                Promise.all(
+                  convoKeys.map(
+                    (k) =>
+                      new Promise((r) => {
+                        try {
+                          const g = store.get(k);
+                          g.onsuccess = () => r(g.result || null);
+                          g.onerror = () => r(null);
+                        } catch {
+                          r(null);
+                        }
+                      }),
+                  ),
+                ).then((recs) => {
+                  const sorted = recs.filter(Boolean).sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0));
+                  for (let i = 0; i < sorted.length - 8; i++) {
+                    try { store.delete(sorted[i].key); } catch {}
+                  }
+                });
+              };
+            }
+          }
+          const finish = () => {
+            try { db.close(); } catch {}
+            resolve();
+          };
+          tx.oncomplete = finish;
+          tx.onerror = finish;
+          tx.onabort = finish;
+        } catch {
+          try { db.close(); } catch {}
+          resolve();
+        }
+      };
+    } catch {
+      resolve();
+    }
+  });
+}
+
+async function prewarmNotificationAssets(cascadeId) {
+  const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = ac ? setTimeout(() => ac.abort(), 4000) : 0;
+  const tasks = [
+    caches
+      .open(CACHE_NAME)
+      .then((cache) => cache.match(APP_SHELL_KEY).then((hit) => revalidateAppShell(cache, hit)))
+      .catch(() => {}),
+  ];
+  if (typeof cascadeId === 'string' && CONVO_UUID_RE.test(cascadeId)) {
+    tasks.push(
+      fetch('/relay-cache/convo/' + encodeURIComponent(cascadeId), {
+        credentials: 'same-origin',
+        cache: 'no-store',
+        ...(ac ? { signal: ac.signal } : {}),
+      })
+        .then((resp) => (resp && resp.ok ? resp.json() : null))
+        .then((json) => (json ? writeIdbSnapshot('convo:' + cascadeId, json) : null))
+        .catch(() => {}),
+    );
+  }
+  try {
+    await Promise.allSettled(tasks);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 self.addEventListener('push', (event) => {
   let data = {};
   if (event.data) {
@@ -69,23 +169,27 @@ self.addEventListener('push', (event) => {
   const tag = data.tag || 'agy-relay-push';
 
   event.waitUntil((async () => {
+    let skipShow = false;
     if (!force) {
       try {
         const list = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-        if (list.some((c) => c.focused === true)) return;
+        skipShow = list.some((c) => c.focused === true);
       } catch {}
     }
-    await self.registration.showNotification(title, {
-      body,
-      badge: '/relay-icon-192.png',
-      tag,
-      renotify: Boolean(data.tag),
-      silent: true,
-      data: {
-        url: data.url || '/',
-        cascadeId: data.cascadeId || '',
-      },
-    });
+    if (!skipShow) {
+      await self.registration.showNotification(title, {
+        body,
+        badge: '/relay-icon-192.png',
+        tag,
+        renotify: Boolean(data.tag),
+        silent: true,
+        data: {
+          url: data.url || '/',
+          cascadeId: data.cascadeId || '',
+        },
+      });
+    }
+    await prewarmNotificationAssets(data.cascadeId);
   })());
 });
 
@@ -113,17 +217,18 @@ self.addEventListener('notificationclick', (event) => {
     };
     const client = sameOriginClients.find((c) => !isNonSpaPath(c)) || sameOriginClients[0] || null;
     if (client) {
+      if (!isNonSpaPath(client) && payload.cascadeId) {
+        try {
+          client.postMessage({ type: 'AGY_OPEN_CASCADE', cascadeId: payload.cascadeId, url: targetUrl });
+        } catch {}
+        try { await client.focus(); } catch {}
+        return;
+      }
       try { await client.focus(); } catch {}
       if (isNonSpaPath(client)) {
         if (typeof client.navigate === 'function') {
           try { await client.navigate(targetUrl); } catch {}
         }
-        return;
-      }
-      if (payload.cascadeId) {
-        try {
-          client.postMessage({ type: 'AGY_OPEN_CASCADE', cascadeId: payload.cascadeId, url: targetUrl });
-        } catch {}
         return;
       }
       if (client.url !== targetUrl && typeof client.navigate === 'function') {
@@ -132,7 +237,11 @@ self.addEventListener('notificationclick', (event) => {
       return;
     }
     if (typeof self.clients.openWindow === 'function') {
-      await self.clients.openWindow(targetUrl);
+      if (payload.cascadeId) {
+        await Promise.allSettled([self.clients.openWindow(targetUrl), prewarmNotificationAssets(payload.cascadeId)]);
+      } else {
+        await self.clients.openWindow(targetUrl);
+      }
     }
   })());
 });

@@ -15,7 +15,8 @@ agy-web-relay/
 │   ├── static-cache.mjs     # 内存/磁盘 Brotli/Gzip/Zstd 协商缓存与 ETag 条件响应
 │   ├── html-patch.mjs       # SPA Shell 识别、CSRF Token 注入与移动端头改写
 │   ├── local-proxy.mjs      # /_relay_local/ 本机开发服务反代与 CSP/HTML 改写
-│   ├── local-routes.mjs     # /relay-health、/relay-push/*、/relay-plugin/* 等本地路由
+│   ├── local-routes.mjs     # /relay-health、/relay-cache/*、/relay-push/*、/relay-plugin/* 路由
+│   ├── convo-snapshot.mjs   # 单会话首帧快照抽取与内存 LRU 缓存（供通知到达预热）
 │   ├── upstream-h2.mjs      # 单例上游 HTTP/2 连接池、静态预热与回源合并
 │   ├── ws-upgrade.mjs       # HTTP/1.1 WebSocket Upgrade 转发与断线重选端口
 │   ├── context-bridge.mjs   # 可选 antigravity-context 插件指标与偏好桥接
@@ -53,4 +54,4 @@ agy-web-relay.mjs (node:http2 + allowHTTP1)
 1. **服务端内存 + 磁盘压缩缓存 (`lib/static-cache.mjs`)**：上游 `/main.js` 等大包使用 120 秒 TTL 与 `If-None-Match` 条件回源；`br`（q11 后台升级）、`gzip` 与 `zstd` 持久化至 `~/.config/agy-web-relay/cache`，HTML 注入与 RPC 响应按协商编码异步压缩并支持流式 Gzip。
 2. **HTML Shell 骨架与记忆化 (`agy-web-relay.mjs`, `client/mobile.css`)**：代理 `/` 与 `/c/<uuid>` 时注入真实 `csrfToken`、版本化资源 `<link rel="preload">`、`103 Early Hints` 与 `#root:empty` 骨架样式，并计算 `x-agy-shell-hash` 响应头供客户端增量校验。
 3. **Service Worker App Shell (`client/sw.js`)**：导航请求直接返回已缓存的 `/__agy_app_shell` 并在后台触发 `revalidateShell`，`x-agy-shell-hash` 变化时自动通知页面更新 `window.__APP_CONFIG__.csrfToken` 与运行时配置。
-4. **IndexedDB + 预取控制流 (`client/idb-cache.js`, `client/ws-control.js`)**：页面脚本执行即并发预取 `GetUserStatus`、`JetboxSubscribeToSummaries` 与当前会话状态；服务端尚未吐帧前，优先从 `agy-relay-cache-v1`（24 小时 TTL，`boot:summaries` 裁剪至最多 150 条，`convo:*` 最多保留最近 8 个会话）同步或异步吐出缓存帧，真实流量到达后无缝合并接管并防抖落盘。
+4. **IndexedDB + 预取控制流 (`client/idb-cache.js`, `client/ws-control.js`)**：页面脚本执行即并发预取 `GetUserStatus`、`JetboxSubscribeToSummaries` 与当前会话状态（进入 `/c/<uuid>` 时优先建流目标会话并短时延后全量摘要，同时复用在途预取流避免重复 RPC）；服务端尚未吐帧前，优先从 `agy-relay-cache-v1`（24 小时 TTL，`boot:summaries` 裁剪至最多 150 条，`convo:*` 最多保留最近 8 个会话）同步或异步吐出缓存帧，真实流量到达后无缝合并接管并防抖落盘。

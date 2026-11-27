@@ -99,35 +99,37 @@
       return hit.data;
     }
 
-    function getConvoAsync(cascadeId) {
+    function getConvoAsync(cascadeId, opts = null) {
       if (!cascadeId) return Promise.resolve(null);
       const key = 'convo:' + cascadeId;
+      const bypassMemory = Boolean(opts && opts.bypassMemory);
       const mem = getBoot(key);
-      if (mem !== null) return Promise.resolve(mem);
+      if (!bypassMemory && mem !== null) return Promise.resolve(mem);
       return openDb()
         .then((db) => {
-          if (!db) return null;
+          if (!db) return bypassMemory ? mem : null;
           return new Promise((resolve) => {
             try {
               const tx = db.transaction(STORE_NAME, 'readonly');
               const store = tx.objectStore(STORE_NAME);
               readRecord(store, key).then((rec) => {
                 if (!isFresh(rec)) {
-                  resolve(null);
+                  resolve(bypassMemory ? mem : null);
                   return;
                 }
-                if (!bootMemory.has(key)) {
+                const prev = bootMemory.get(key);
+                if (!prev || rec.updatedAt >= prev.updatedAt) {
                   bootMemory.set(key, { data: rec.data, updatedAt: rec.updatedAt });
                 }
                 resolve(rec.data);
               });
-              tx.onerror = () => resolve(null);
+              tx.onerror = () => resolve(bypassMemory ? mem : null);
             } catch {
-              resolve(null);
+              resolve(bypassMemory ? mem : null);
             }
           });
         })
-        .catch(() => null);
+        .catch(() => (bypassMemory ? mem : null));
     }
 
     function pruneOldConvoKeys(store) {

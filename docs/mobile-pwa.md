@@ -14,7 +14,7 @@
    - 对话完成生成时触发完成通知；
    - 出现等待用户确认的步骤（命令执行、文件权限、等待输入等）时触发提醒通知；
    - 推送返回 `404` / `410` 的失效订阅会自动清理。
-3. **无刷新通知跳转**：点击通知时，[client/sw.js](../client/sw.js) 优先向已打开的 SPA 客户端发送 `AGY_OPEN_CASCADE`，前端通过 `history.pushState` 与内部切换逻辑打开对应 `/c/<uuid>`，保留当前插件注入状态且无需整页重载；若从通知冷启动新窗口，`/c/<uuid>` 由 App Shell 与 IndexedDB 快照快速恢复。
+3. **通知预热与无刷新直达跳转**：服务端在派发通知的同时异步预热目标会话首帧至 [lib/convo-snapshot.mjs](../lib/convo-snapshot.mjs)，[client/sw.js](../client/sw.js) 弹出系统通知后随即预热 App Shell 并拉取 `/relay-cache/convo/<uuid>` 写入本地 IndexedDB；点击通知时优先向已打开的 SPA 客户端并发派发 `AGY_OPEN_CASCADE` 并同步唤醒与预热连接，无需等待整页重载即可直接切换并展示最新状态。
 
 ## 3. 本机开发服务反向代理 (`/_relay_local/`)
 

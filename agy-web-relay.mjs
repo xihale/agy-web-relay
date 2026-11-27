@@ -27,6 +27,7 @@ import {
   resolveBindIp,
 } from './lib/cli-tls.mjs';
 import { createContextBridgeLoader } from './lib/context-bridge.mjs';
+import { createConvoSnapshotCache } from './lib/convo-snapshot.mjs';
 import { injectCsrfToken, injectMobileHead, isHtmlCandidatePath, isSpaShellHtml, shouldPatchSpaHtml } from './lib/html-patch.mjs';
 import {
   appendSetCookie,
@@ -165,14 +166,20 @@ async function main() {
   ]);
 
   const upstream = createUpstreamManager({ opts });
+  const convoSnapshotCache = createConvoSnapshotCache({ getTargetInfo: upstream.getTargetInfo });
   const getContextBridge = createContextBridgeLoader({ getTargetInfo: upstream.getTargetInfo });
-  const webPushManager = createWebPushManager({ configDir: CONFIG_DIR, getTargetInfo: upstream.getTargetInfo });
+  const webPushManager = createWebPushManager({
+    configDir: CONFIG_DIR,
+    getTargetInfo: upstream.getTargetInfo,
+    onNotifyPrewarm: (id) => convoSnapshotCache.warm(id),
+  });
   const proxyLocalTarget = createLocalTargetProxy({ localHttpAgent, localHttpsAgent });
   const handleLocalRoute = createLocalRouteHandler({
     localStaticRoutes,
     getTargetPort: upstream.getTargetPort,
     getContextBridge,
     webPushManager,
+    convoSnapshotCache,
   });
 
   const rootHtmlMemo = new Map();

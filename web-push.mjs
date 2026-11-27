@@ -370,6 +370,7 @@ export function createSummaryNotificationTracker(onNotify) {
 export function createWebPushManager({
   configDir,
   getTargetInfo,
+  onNotifyPrewarm,
   fetchImpl = globalThis.fetch,
   log = console.log,
   warn = console.warn,
@@ -413,7 +414,11 @@ export function createWebPushManager({
   let reconnectAttempt = 0;
 
   const tracker = createSummaryNotificationTracker((eventPayload) => {
-    if (disposed || state.subscriptions.length === 0) return;
+    if (disposed) return;
+    if (eventPayload?.cascadeId && typeof onNotifyPrewarm === 'function') {
+      Promise.resolve(onNotifyPrewarm(eventPayload.cascadeId)).catch(() => {});
+    }
+    if (state.subscriptions.length === 0) return;
     void broadcast(eventPayload).catch((err) => {
       warn?.(`[web-push] broadcast error: ${err?.message || err}`);
     });

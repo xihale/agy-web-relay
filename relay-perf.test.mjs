@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
 
 import { createFastUsageReader, injectMobileHead, shouldPatchSpaHtml } from './agy-web-relay.mjs';
+import { createConvoSnapshotCache } from './lib/convo-snapshot.mjs';
 import { MOBILE_CSS, MOBILE_JS, SW_JS } from './mobile-assets.mjs';
 
 test('SW_JS and MOBILE_JS parse cleanly', () => {
@@ -1255,6 +1257,375 @@ test('IndexedDB cold-start cache hydrates boot & convo streams immediately and h
     // 3. Missing / throwing indexedDB degrades gracefully without error
     assert.doesNotThrow(() => vm.runInNewContext(MOBILE_JS, makeBootSandbox(undefined)));
     assert.doesNotThrow(() => vm.runInNewContext(MOBILE_JS, makeBootSandbox({ open: () => { throw new Error('IDB blocked'); } })));
+  } finally {
+    for (const id of timers) clearTimeout(id);
+    for (const id of intervals) clearInterval(id);
+  }
+});
+
+test('createConvoSnapshotCache extracts first Connect-JSON frame, aborts stream, and coalesces/caches hits', async () => {
+  let reqCount = 0;
+  let openStreams = 0;
+  const server = http.createServer((req, res) => {
+    reqCount++;
+    openStreams++;
+    req.resume();
+    res.writeHead(200, { 'content-type': 'application/connect+json' });
+    const payload = Buffer.from(
+      JSON.stringify({ cascadeId: '00000000-0000-4000-8000-000000000001', steps: [{ id: 'first-frame' }] }),
+      'utf8',
+    );
+    const frame = Buffer.alloc(5 + payload.length);
+    frame[0] = 0;
+    frame.writeUInt32BE(payload.length, 1);
+    payload.copy(frame, 5);
+    res.write(frame);
+    req.on('close', () => {
+      openStreams--;
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const port = server.address().port;
+    const snapCache = createConvoSnapshotCache({
+      getTargetInfo: async () => ({ port: port + 1, httpPort: port, csrfToken: 'snap-csrf' }),
+    });
+    const cid = '00000000-0000-4000-8000-000000000001';
+    const [b1, b2] = await Promise.all([snapCache.getSnapshot(cid), snapCache.getSnapshot(cid)]);
+    assert.equal(reqCount, 1);
+    assert.equal(JSON.parse(b1.toString('utf8')).steps[0].id, 'first-frame');
+    assert.equal(b1.toString('utf8'), b2.toString('utf8'));
+    const b3 = await snapCache.getSnapshot(cid);
+    assert.equal(reqCount, 1);
+    assert.equal(b3.toString('utf8'), b1.toString('utf8'));
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(openStreams, 0);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('SW_JS push pre-warms convo snapshot into IndexedDB and notificationclick posts AGY_OPEN_CASCADE before focus', async () => {
+  const listeners = new Map();
+  const storeMap = new Map();
+  const idbData = new Map();
+  const eventsOrder = [];
+  const notifCalls = [];
+  const postedMsgs = [];
+  let fetchedConvoUrl = '';
+
+  const reqWrap = (run) => {
+    const req = { result: undefined, onsuccess: null, onerror: null, onupgradeneeded: null, onblocked: null };
+    queueMicrotask(() => run(req));
+    return req;
+  };
+  const db = {
+    objectStoreNames: { contains: () => true },
+    createObjectStore: () => ({}),
+    close: () => {},
+    transaction: () => {
+      const tx = { oncomplete: null, onerror: null, onabort: null };
+      const store = {
+        get: (k) => reqWrap((req) => { req.result = idbData.get(k); req.onsuccess?.(); }),
+        put: (v) => reqWrap((req) => { idbData.set(v.key, v); req.result = v.key; req.onsuccess?.(); }),
+        delete: (k) => reqWrap((req) => { idbData.delete(k); req.onsuccess?.(); }),
+        getAllKeys: () => reqWrap((req) => { req.result = Array.from(idbData.keys()); req.onsuccess?.(); }),
+      };
+      tx.objectStore = () => store;
+      setTimeout(() => tx.oncomplete?.(), 2);
+      return tx;
+    },
+  };
+
+  const sandbox = {
+    URL,
+    Headers,
+    Response,
+    AbortController,
+    setTimeout,
+    clearTimeout,
+    atob: (b64) => Buffer.from(b64, 'base64').toString('binary'),
+    indexedDB: { open: () => reqWrap((req) => { req.result = db; req.onsuccess?.(); }) },
+    caches: {
+      keys: async () => ['agy-relay-static-v12'],
+      open: async () => ({
+        match: async (k) => storeMap.get(String(k)) || null,
+        put: async (k, resp) => { storeMap.set(String(k), resp); },
+      }),
+    },
+    fetch: async (input) => {
+      const u = typeof input === 'string' ? input : input.url;
+      if (u.startsWith('/relay-cache/convo/')) {
+        fetchedConvoUrl = u;
+        return new Response(JSON.stringify({ cascadeId: '00000000-0000-4000-8000-000000000001', steps: [{ id: 'prewarmed' }] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response('<html><script>window.__APP_CONFIG__={"csrfToken":"sw-csrf"};</script></html>', {
+        status: 200,
+        headers: { 'content-type': 'text/html', 'x-agy-shell-hash': 'h1' },
+      });
+    },
+    self: null,
+  };
+
+  const cid = '00000000-0000-4000-8000-000000000001';
+  const client = {
+    url: 'https://relay.example:8421/',
+    focused: false,
+    postMessage: (msg) => {
+      eventsOrder.push('postMessage');
+      postedMsgs.push(msg);
+    },
+    focus: async () => {
+      await new Promise((r) => setTimeout(r, 25));
+      eventsOrder.push('focusResolved');
+    },
+  };
+  sandbox.self = {
+    location: { origin: 'https://relay.example:8421' },
+    registration: {
+      showNotification: async (title, opts) => {
+        notifCalls.push({ title, opts });
+      },
+    },
+    clients: {
+      claim: async () => {},
+      matchAll: async () => [client],
+    },
+    skipWaiting: async () => {},
+    addEventListener: (type, fn) => listeners.set(type, fn),
+  };
+
+  vm.runInNewContext(SW_JS, sandbox);
+
+  let waitPromise = Promise.resolve();
+  listeners.get('push')({
+    data: { json: () => ({ title: 'Antigravity', body: 'Done', cascadeId: cid, url: `/c/${cid}`, force: true }) },
+    waitUntil: (p) => { waitPromise = p; },
+  });
+  await waitPromise;
+  assert.equal(notifCalls.length, 1);
+  assert.equal(fetchedConvoUrl, `/relay-cache/convo/${cid}`);
+  assert.equal(idbData.get(`convo:${cid}`)?.data?.steps?.[0]?.id, 'prewarmed');
+  assert.ok(storeMap.has('/__agy_app_shell'));
+
+  let clickWait = Promise.resolve();
+  listeners.get('notificationclick')({
+    notification: { close: () => {}, data: { cascadeId: cid, url: `/c/${cid}` } },
+    waitUntil: (p) => { clickWait = p; },
+  });
+  await clickWait;
+  assert.deepEqual(eventsOrder, ['postMessage', 'focusResolved']);
+  assert.equal(postedMsgs[0].type, 'AGY_OPEN_CASCADE');
+  assert.equal(postedMsgs[0].cascadeId, cid);
+});
+
+test('MOBILE_JS /c/<uuid> prioritizes StreamAgentStateUpdates, adopts convo prefetch, and recovers via AGY_OPEN_CASCADE', async () => {
+  const timers = new Set();
+  const intervals = new Set();
+  const trackTimeout = (fn, ms = 0, ...args) => {
+    const id = setTimeout(() => {
+      timers.delete(id);
+      fn(...args);
+    }, ms);
+    timers.add(id);
+    return id;
+  };
+  const trackClearTimeout = (id) => {
+    timers.delete(id);
+    clearTimeout(id);
+  };
+  const trackInterval = (fn, ms = 0, ...args) => {
+    const id = setInterval(fn, ms, ...args);
+    intervals.add(id);
+    return id;
+  };
+  const trackClearInterval = (id) => {
+    intervals.delete(id);
+    clearInterval(id);
+  };
+
+  const cid = '00000000-0000-4000-8000-000000000001';
+  const idbData = new Map([
+    [`convo:${cid}`, { key: `convo:${cid}`, data: { cascadeId: cid, steps: [{ id: 'old-idb' }] }, updatedAt: Date.now() }],
+  ]);
+  const reqWrap = (run) => {
+    const req = { result: undefined, onsuccess: null, onerror: null, onupgradeneeded: null, onblocked: null };
+    queueMicrotask(() => run(req));
+    return req;
+  };
+  const db = {
+    objectStoreNames: { contains: () => true },
+    createObjectStore: () => ({}),
+    close: () => {},
+    transaction: () => {
+      const tx = { oncomplete: null, onerror: null, onabort: null };
+      const store = {
+        get: (k) => reqWrap((req) => { req.result = idbData.get(k); req.onsuccess?.(); }),
+        put: (v) => reqWrap((req) => { idbData.set(v.key, v); req.result = v.key; req.onsuccess?.(); }),
+        delete: (k) => reqWrap((req) => { idbData.delete(k); req.onsuccess?.(); }),
+        getAllKeys: () => reqWrap((req) => { req.result = Array.from(idbData.keys()); req.onsuccess?.(); }),
+      };
+      tx.objectStore = () => store;
+      trackTimeout(() => tx.oncomplete?.(), 2);
+      return tx;
+    },
+  };
+
+  const sockets = [];
+  class OrderedWS extends EventTarget {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
+    constructor(url) {
+      super();
+      this.url = url;
+      this.readyState = 0;
+      this.sent = [];
+      sockets.push(this);
+      trackTimeout(() => {
+        if (this.readyState !== 0) return;
+        this.readyState = 1;
+        this.onopen?.(new Event('open'));
+        this.dispatchEvent(new Event('open'));
+      }, 2);
+    }
+    send(raw) {
+      this.sent.push(raw);
+    }
+    close(code = 1000, reason = '') {
+      this.readyState = 3;
+      this.onclose?.({ code, reason, wasClean: true });
+    }
+  }
+
+  let swMsgListener = null;
+  const lsMap = new Map();
+  const sandbox = {
+    URL,
+    Event,
+    EventTarget,
+    MessageEvent,
+    CloseEvent: class CloseEvent extends Event {
+      constructor(type, init = {}) {
+        super(type);
+        this.code = init.code ?? 1000;
+      }
+    },
+    TextDecoder,
+    TextEncoder,
+    DecompressionStream: class {},
+    WebSocket: OrderedWS,
+    Response,
+    indexedDB: { open: () => reqWrap((req) => { req.result = db; req.onsuccess?.(); }) },
+    setTimeout: trackTimeout,
+    clearTimeout: trackClearTimeout,
+    setInterval: trackInterval,
+    clearInterval: trackClearInterval,
+    queueMicrotask,
+    requestAnimationFrame: (fn) => trackTimeout(fn, 0),
+    __APP_CONFIG__: { csrfToken: 'boot-csrf' },
+    localStorage: {
+      length: 0,
+      key: () => null,
+      getItem: (k) => (lsMap.has(k) ? lsMap.get(k) : null),
+      setItem: (k, v) => lsMap.set(k, String(v)),
+      removeItem: (k) => lsMap.delete(k),
+    },
+    navigator: {
+      serviceWorker: {
+        register: async () => ({}),
+        addEventListener: (type, fn) => { if (type === 'message') swMsgListener = fn; },
+      },
+    },
+    document: {
+      readyState: 'complete',
+      head: { appendChild: () => {} },
+      documentElement: { style: { setProperty: () => {}, removeProperty: () => {} }, appendChild: () => {} },
+      createElement: () => ({ setAttribute: () => {}, append: () => {} }),
+      addEventListener: () => {},
+      querySelector: () => null,
+      getElementById: () => null,
+      getElementsByTagName: () => [],
+      visibilityState: 'visible',
+    },
+    location: {
+      protocol: 'https:',
+      host: 'relay.example:8421',
+      origin: 'https://relay.example:8421',
+      href: `https://relay.example:8421/c/${cid}`,
+      pathname: `/c/${cid}`,
+      search: '',
+    },
+    fetch: async () => new Response('{}', { status: 200 }),
+    addEventListener: () => {},
+  };
+  sandbox.window = sandbox;
+  sandbox.top = sandbox;
+
+  try {
+    vm.runInNewContext(MOBILE_JS, sandbox);
+    await new Promise((r) => setTimeout(r, 15));
+
+    const earlyRaw = sockets[0];
+    const startTypes = earlyRaw.sent.map((s) => JSON.parse(s).procedure);
+    const convoIdx = startTypes.indexOf('/exa.language_server_pb.LanguageServerService/StreamAgentStateUpdates');
+    assert.ok(convoIdx >= 0, 'Expected boot convo prefetch');
+    assert.equal(startTypes.indexOf('/exa.language_server_pb.LanguageServerService/JetboxSubscribeToSummaries'), -1);
+
+    // Adopt in-flight convo prefetch without duplicate wire RPC
+    const sock = new sandbox.WebSocket('wss://relay.example:8421/connect-websocket');
+    const msgs = [];
+    sock.addEventListener('message', (ev) => msgs.push(JSON.parse(ev.data)));
+    const sentBefore = earlyRaw.sent.length;
+    sock.send(JSON.stringify({
+      streamId: 'real-c1',
+      type: 'start',
+      procedure: '/exa.language_server_pb.LanguageServerService/StreamAgentStateUpdates',
+      stream: true,
+      payload: { conversationId: cid, initialStepsPageBounds: { startIndex: -50 } },
+    }));
+    assert.equal(earlyRaw.sent.length, sentBefore);
+
+    // Prefetch frame arrives -> rewritten to real-c1 AND flushes deferred JetboxSubscribeToSummaries
+    earlyRaw.onmessage(new MessageEvent('message', {
+      data: JSON.stringify({ streamId: '__agy_pre_1', type: 'data', payload: { cascadeId: cid, steps: [{ id: 'live-1' }] } }),
+    }));
+    await new Promise((r) => setTimeout(r, 10));
+    assert.ok(msgs.some((m) => m.streamId === 'real-c1' && m.payload?.steps?.[0]?.id === 'old-idb'));
+    assert.ok(msgs.some((m) => m.streamId === 'real-c1' && m.payload?.steps?.[0]?.id === 'live-1'));
+    assert.ok(earlyRaw.sent.some((s) => s.includes('JetboxSubscribeToSummaries')));
+
+    // Close active socket, simulate SW updating IDB while in background, then trigger AGY_OPEN_CASCADE
+    sock.close();
+    idbData.set(`convo:${cid}`, {
+      key: `convo:${cid}`,
+      data: { cascadeId: cid, steps: [{ id: 'fresh-from-sw' }] },
+      updatedAt: Date.now() + 50,
+    });
+    const socketsBeforeNotif = sockets.length;
+    swMsgListener?.({ data: { type: 'AGY_OPEN_CASCADE', cascadeId: cid, url: `/c/${cid}` } });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(sockets.length, socketsBeforeNotif + 1, 'Expected standby socket prewarmed even when active closed');
+
+    const standbyWrap = new sandbox.WebSocket('wss://relay.example:8421/connect-websocket');
+    const standbyMsgs = [];
+    standbyWrap.addEventListener('message', (ev) => standbyMsgs.push(JSON.parse(ev.data)));
+    standbyWrap.send(JSON.stringify({
+      streamId: 'real-c2',
+      type: 'start',
+      procedure: '/exa.language_server_pb.LanguageServerService/StreamAgentStateUpdates',
+      stream: true,
+      payload: { conversationId: cid },
+    }));
+    await new Promise((r) => setTimeout(r, 15));
+    assert.ok(
+      standbyMsgs.some((m) => m.streamId === 'real-c2' && m.payload?.steps?.[0]?.id === 'fresh-from-sw'),
+      'Expected fresh SW IDB snapshot to override stale memory cache',
+    );
   } finally {
     for (const id of timers) clearTimeout(id);
     for (const id of intervals) clearInterval(id);
